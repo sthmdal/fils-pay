@@ -4,6 +4,7 @@ import type { Config } from "../config.js";
 import { withTransaction } from "../db/withTransaction.js";
 import { decodeEncryptionKey, decryptSecret } from "./secretCrypto.js";
 import { signPayload } from "./sign.js";
+import { canonicalJson } from "../payments/idempotency.js";
 import { buildEnvelope } from "./envelope.js";
 import { recordPayoutDisbursementEffect } from "./payoutDisbursement.js";
 import { WEBHOOK_DELIVERY_ID_HEADER, WEBHOOK_SIGNATURE_HEADER } from "./headers.js";
@@ -22,12 +23,12 @@ import type { WebhookTransport } from "./transport.js";
 
 const STEP_A_BATCH_LIMIT = 500;
 const STEP_B_BATCH_LIMIT = 100;
-// add refund.succeeded here when refunds ship, thats all it needs — am
-// YA: adding a type here without a buildEnvelope case throws in Step A and stalls the whole queue. envelope.ts first.
-// MK: settlement.batch_closed taken out of this list in Feb (too noisy). docs still mention it
+// Every type listed here must have a buildEnvelope case (envelope.ts), or
+// Step A throws and stalls the whole queue.
 const WEBHOOK_ELIGIBLE_EVENT_TYPES: readonly string[] = [
   "transaction.captured",
   "transaction.voided",
+  "refund.succeeded",
   "settlement.paid",
 ];
 const NOTIFY_CHANNEL = "outbox_events_channel";
@@ -156,6 +157,10 @@ async function attemptOneDelivery(
   const key = decodeEncryptionKey(config.webhookSecretEncryptionKey);
   const secret = decryptSecret(row.secret_ciphertext, key);
   const { signature } = signPayload(row.payload, secret);
+  // FP-240: send exactly the bytes that were signed. signPayload HMACs
+  // canonicalJson(payload); JSON.stringify of the jsonb row uses Postgres's
+  // key order instead, so receivers verifying the raw body got a mismatch.
+  const body = canonicalJson(row.payload);
 
   if (row.attempt_count === 0) {
     const effect = PRE_DELIVERY_EFFECTS[row.event_type];
@@ -169,7 +174,7 @@ async function attemptOneDelivery(
       [WEBHOOK_DELIVERY_ID_HEADER]: row.delivery_event_id,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(row.payload),
+    body,
     timeoutMs: config.webhookRequestTimeoutMs,
   });
 

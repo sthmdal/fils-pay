@@ -1,12 +1,14 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { toFils } from "@filspay/money";
 import { requireApiKey } from "../apiKeys/verify.js";
-import { requireMerchantAuth, requireMerchantWriterActor } from "../auth/requireMerchantAuth.js";
+import { requireMerchantAuth, requireMerchantRole, requireMerchantWriterActor } from "../auth/requireMerchantAuth.js";
 import { authorizeTransaction, type AuthorizeInput } from "../payments/authorize.js";
 import { captureTransaction } from "../payments/capture.js";
 import { applyCaptureDiscountAdjustment } from "../payments/discountAdjustment.js";
 import { voidTransaction } from "../payments/void.js";
-import { buildTransactionsExportCsv } from "../transactions/exportCsv.js";
+import { once } from "node:events";
+import { PassThrough } from "node:stream";
+import { streamTransactionsExportCsv } from "../transactions/exportCsv.js";
 import { getTransactionById, listTransactions } from "../transactions/query.js";
 import { listTransactionEvents } from "../transactions/events.js";
 import { BadRequestError, NotFoundError } from "../lib/errors.js";
@@ -88,11 +90,9 @@ export async function transactionRoutes(app: FastifyInstance): Promise<void> {
   );
 
   app.post<{ Params: TransactionIdParams; Body: CaptureBody }>(
-    // am: requireMerchantAuth lets impersonation through here too? an admin impersonating can capture
-    // MK: impersonation is read-only, enforced in requireMerchantAuth. fine
-    // MK: confirmed — ADMIN.md says grants are support-level read only
+    // Money-moving: support-role users and admin impersonation must not capture.
     "/:id/capture",
-    { preHandler: requireMerchantAuth },
+    { preHandler: [requireMerchantAuth, requireMerchantRole("owner", "finance")] },
     async (request, reply) => {
       const idempotencyKey = getIdempotencyKey(request);
       const { amountFils } = request.body ?? {};
@@ -118,9 +118,8 @@ export async function transactionRoutes(app: FastifyInstance): Promise<void> {
   );
 
   app.post<{ Params: TransactionIdParams }>(
-    // TODO(FH): role check? finance role users shouldn't void. ask MK
     "/:id/void",
-    { preHandler: requireMerchantAuth },
+    { preHandler: [requireMerchantAuth, requireMerchantRole("owner", "finance")] },
     async (request, reply) => {
       const result = await voidTransaction(app.db, {
         transactionId: request.params.id,
@@ -158,17 +157,31 @@ export async function transactionRoutes(app: FastifyInstance): Promise<void> {
       const q = request.query;
       const status = q.status === undefined ? undefined : Array.isArray(q.status) ? q.status : [q.status];
 
-      const csv = await buildTransactionsExportCsv(app.db, {
-        merchantId: request.merchantAuth!.merchantId,
-        from: q.from ? new Date(q.from) : undefined,
-        to: q.to ? new Date(q.to) : undefined,
-        status,
-      });
+      const from = q.from ? new Date(q.from) : undefined;
+      const to = q.to ? new Date(q.to) : undefined;
+      if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime()))) {
+        throw new BadRequestError("invalid_request", "from/to must be ISO-8601 instants");
+      }
 
+      // Streamed page by page with backpressure, so memory stays flat no
+      // matter how many rows the range holds (512 MB container).
+      const stream = new PassThrough();
       reply
         .header("content-type", "text/csv; charset=utf-8")
         .header("content-disposition", 'attachment; filename="transactions.csv"')
-        .send(csv);
+        .send(stream);
+
+      streamTransactionsExportCsv(
+        app.db,
+        { merchantId: request.merchantAuth!.merchantId, from, to, status },
+        async (chunk) => {
+          if (!stream.write(chunk)) await once(stream, "drain");
+        },
+      ).then(
+        () => stream.end(),
+        (err: unknown) => stream.destroy(err instanceof Error ? err : new Error(String(err))),
+      );
+      return reply;
     },
   );
 

@@ -345,9 +345,9 @@ test("decline path: an endpoint returning 500 leaves the delivery pending with b
   }
 });
 
-// YA: new delivery id on replay is what ARCH §5 asks for
-// am: §5 says stable id?? reading it again later
-test("replay: creates a new row referencing the original, with a new delivery_event_id; original row untouched", async () => {
+// The delivery id is the receiver's dedupe key (0022, ARCHITECTURE §Events),
+// so a replay keeps it; only the row (attempt history) is new.
+test("replay: creates a new row referencing the original, with the SAME delivery_event_id; original row untouched", async () => {
   const { rawKey, merchantId } = await createApprovedMerchantWithApiKey("replay-flow");
   const receiver = await startTestReceiver(200);
   try {
@@ -402,11 +402,12 @@ test("replay: creates a new row referencing the original, with a new delivery_ev
     assert.equal(originalAfter!.replay_of_delivery_id, null);
     assert.equal(originalAfter!.delivery_event_id, original.delivery_event_id);
 
-    // Replay row references the original, has its own new delivery_event_id,
-    // and describes the same underlying outbox event.
+    // Replay row references the original, carries the same delivery_event_id
+    // (so a receiver that already processed it dedupes), and describes the
+    // same underlying outbox event.
     assert.equal(replayRow!.replay_of_delivery_id, original.id);
     assert.equal(replayRow!.status, "succeeded");
-    assert.notEqual(replayRow!.delivery_event_id, original.delivery_event_id);
+    assert.equal(replayRow!.delivery_event_id, original.delivery_event_id);
     assert.equal(replayRow!.outbox_event_id, originalAfter!.outbox_event_id);
   } finally {
     await receiver.close();

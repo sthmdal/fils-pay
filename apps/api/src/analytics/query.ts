@@ -291,9 +291,14 @@ interface LedgerActivityRow {
  * are (this bypasses the rollups entirely, on purpose, same as
  * `getTopLinks`).
  *
- * `from`/`to` are Bahrain business-date strings (YYYY-MM-DD), matched against
- * `occurred_at` in Bahrain local calendar terms — Bahrain observes no DST
- * (fixed UTC+3 since 1972), so this reduces to a `date` comparison per row.
+ * `from`/`to` are Bahrain business-date strings (YYYY-MM-DD), both
+ * inclusive, matched against `occurred_at` in Bahrain local calendar terms.
+ *
+ * The bounds are converted to instants once, so the predicate is a plain
+ * range on occurred_at and uses idx_ledger_entries_merchant_occurred. It
+ * used to cast every row (`(occurred_at AT TIME ZONE ...)::date BETWEEN`),
+ * which can't use the index and scanned the merchant's entire ledger history
+ * on every dashboard load — the "suspiciously slow" reporting query.
  */
 export async function getRecentLedgerActivity(
   pool: Pool,
@@ -303,7 +308,8 @@ export async function getRecentLedgerActivity(
     `SELECT id, account_id, direction, amount_fils, occurred_at, description
        FROM ledger_entries
       WHERE merchant_id = $1
-        AND (occurred_at AT TIME ZONE 'Asia/Bahrain')::date BETWEEN $2::date AND $3::date
+        AND occurred_at >= ($2::date::timestamp AT TIME ZONE 'Asia/Bahrain')
+        AND occurred_at <  (($3::date + 1)::timestamp AT TIME ZONE 'Asia/Bahrain')
       ORDER BY occurred_at DESC
       LIMIT 200`,
     [input.merchantId, input.from, input.to],

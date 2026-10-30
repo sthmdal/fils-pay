@@ -12,7 +12,7 @@ const SECRET = "acqsec_test_secret";
 
 /** Builds the header the acquirer would send for a given payload — the same
  *  `t=<seconds>,v1=<hex>` shape webhooks/sign.ts uses outbound. */
-function acquirerHeader(payload: unknown, secret: string, timestamp = 1_757_930_000): string {
+function acquirerHeader(payload: unknown, secret: string, timestamp = Math.floor(Date.now() / 1000)): string {
   const signature = createHmac("sha256", secret).update(`${timestamp}.${JSON.stringify(payload)}`).digest("hex");
   return `t=${timestamp},v1=${signature}`;
 }
@@ -46,8 +46,20 @@ test("a malformed header is rejected (malformed_header)", () => {
   assert.equal(verifyAcquirerCallbackSignature(payload, "v1=deadbeef", SECRET).reason, "malformed_header");
 });
 
-test("an unsigned callback is accepted while signature checking is optional", () => {
+test("an unsigned callback is rejected by default — the signature is the endpoint's only auth", () => {
   const payload = { callbackId: "acqcb_1", outcome: "cleared" };
   const result = verifyAcquirerCallbackSignature(payload, undefined, SECRET);
-  assert.deepEqual(result, { valid: true });
+  assert.deepEqual(result, { valid: false, reason: "missing_signature" });
+});
+
+test("a stale (replayed) signature is rejected", () => {
+  const payload = { callbackId: "acqcb_1", outcome: "cleared" };
+  const header = acquirerHeader(payload, SECRET, 1_757_930_000);
+  const result = verifyAcquirerCallbackSignature(payload, header, SECRET);
+  assert.deepEqual(result, { valid: false, reason: "timestamp_out_of_tolerance" });
+});
+
+test("an empty secret never verifies", () => {
+  const payload = { callbackId: "acqcb_1" };
+  assert.equal(verifyAcquirerCallbackSignature(payload, acquirerHeader(payload, ""), "").valid, false);
 });

@@ -6,6 +6,7 @@ package splits
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -88,6 +89,8 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 	}
 
 	var shares []ChildShare
+	var weights []ChildWeight
+	var totalWeightBps int64
 	for rows.Next() {
 		var childID uuid.UUID
 		var weightBps int64
@@ -95,14 +98,30 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 			rows.Close()
 			return SplitPayoutResult{}, err
 		}
-		share := money.ApplyRateFils(money.Fils(netPayout), weightBps)
-		shares = append(shares, ChildShare{ChildMerchantID: childID, WeightBps: weightBps, AllocatedFils: share})
+		shares = append(shares, ChildShare{ChildMerchantID: childID, WeightBps: weightBps})
+		weights = append(weights, ChildWeight{WeightBps: weightBps})
+		totalWeightBps += weightBps
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
 		return SplitPayoutResult{}, err
 	}
 	rows.Close()
+
+	// 0045 says a parent's weights must sum to 10000 but nothing enforced it
+	// (FP-250 was closed on the claim that "the seed always writes 10000").
+	// Paying out a batch against a broken configuration would send the wrong
+	// amounts; refuse instead, leaving the batch 'closed' for ops to fix.
+	if totalWeightBps != 10_000 {
+		return SplitPayoutResult{}, fmt.Errorf("splits: PayoutSplitBatch: parent %s split weights sum to %d bps, want 10000",
+			parentMerchantID, totalWeightBps)
+	}
+
+	// Exact allocation: the shares sum to net_payout_fils, to the fil.
+	allocations := ChildShares(money.Fils(netPayout), weights)
+	for i := range shares {
+		shares[i].AllocatedFils = allocations[i]
+	}
 
 	var totalAllocated money.Fils
 	for _, s := range shares {
@@ -133,8 +152,8 @@ func PayoutSplitBatch(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID) 
 
 	// Bring the parent's cached balance down by what the legs above actually
 	// debited from its merchant_payable account, same as PayoutBatch does
-	// for a non-split merchant.
-	// am: should pass netPayout here not totalAllocated, otherwise the cache drifts from the batch
+	// for a non-split merchant. With exact allocation this equals the
+	// batch's net payout.
 	if err := balances.ApplyPayout(ctx, tx, parentMerchantID, batchID, totalAllocated); err != nil {
 		return SplitPayoutResult{}, err
 	}

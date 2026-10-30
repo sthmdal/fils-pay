@@ -26,5 +26,11 @@ export function buildDelete(
   filters: Record<string, unknown>,
 ): { text: string; values: unknown[] } {
   const { clause, values } = buildWhere(filters);
-  return { text: `DELETE FROM ${table} ${clause}`.trim(), values };
+  // buildWhere silently drops empty/undefined filters. For a DELETE that
+  // turns "delete these zero rows" into "delete every row" — which is what
+  // expire_holds did on any night with nothing expired.
+  if (clause === "") {
+    throw new Error(`buildDelete: refusing to delete from ${table} without a WHERE clause`);
+  }
+  return { text: `DELETE FROM ${table} ${clause}`, values };
 }

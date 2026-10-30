@@ -29,8 +29,12 @@ func LoadFeeSchedules(ctx context.Context, tx pgx.Tx, merchantID uuid.UUID) ([]F
 	rows, err := tx.Query(ctx, `
 		SELECT effective_from, mdr_bps FROM fee_schedules
 		 WHERE merchant_id = $1
-		 ORDER BY effective_from ASC
+		 ORDER BY effective_from ASC, created_at ASC
 	`, merchantID)
+	// created_at breaks effective_from ties the same way apps/api's
+	// feeSchedule.ts does (latest entry wins). Without it, two rows with the
+	// same effective_from came back in arbitrary order and capture and
+	// settlement could pick different rates for the same event.
 	if err != nil {
 		return nil, err
 	}

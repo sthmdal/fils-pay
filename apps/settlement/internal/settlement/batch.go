@@ -216,13 +216,63 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 		batchGross += grossForTxn
 		batchFee += feeForTxn
 	}
+	captureGross := batchGross
+
+	// Step 8b (FP-300): net this merchant's not-yet-settled refunds out of
+	// the batch. A refund already debited merchant_payable (and credited
+	// back its fee reversal) when it happened; settlement only has to stop
+	// paying out money that went back to the cardholder. Amounts are read
+	// from the refunds row as journaled, never recomputed at today's rate.
+	// No lower bound on the window: a refund left unbatched by an earlier
+	// run is picked up by the next close rather than stranded.
+	refundRows, err := tx.Query(ctx, `
+		SELECT id, amount_fils, fee_reversed_fils
+		  FROM refunds
+		 WHERE merchant_id = $1
+		   AND status = 'succeeded'
+		   AND settlement_batch_id IS NULL
+		   AND occurred_at < $2
+		 FOR UPDATE
+	`, merchantID, end)
+	if err != nil {
+		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: select unbatched refunds: %w", err)
+	}
+	var refundIDs []uuid.UUID
+	var refundGross, refundFeeReversed money.Fils
+	for refundRows.Next() {
+		var id uuid.UUID
+		var amount, feeReversed int64
+		if err := refundRows.Scan(&id, &amount, &feeReversed); err != nil {
+			refundRows.Close()
+			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: scan refund: %w", err)
+		}
+		refundIDs = append(refundIDs, id)
+		refundGross += money.Fils(amount)
+		refundFeeReversed += money.Fils(feeReversed)
+	}
+	if err := refundRows.Err(); err != nil {
+		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: iterate refunds: %w", err)
+	}
+	refundRows.Close()
+	// A batch never pays out a negative amount. If today's refunds outweigh
+	// today's captures, leave them unbatched: they carry forward and are
+	// netted against the next batch with enough captured volume, so the
+	// money is recovered instead of silently written off.
+	if NetPayableFils(batchGross-refundGross, batchFee-refundFeeReversed) < 0 {
+		refundIDs = nil
+		refundGross, refundFeeReversed = 0, 0
+	}
+	batchGross -= refundGross
+	batchFee -= refundFeeReversed
+
 	netPayout := NetPayableFils(batchGross, batchFee)
 
 	// Record this batch's contribution to the platform-wide lifetime
 	// processed-volume counter, in the same transaction that freezes this
 	// batch's own totals — so the counter and the batch it describes
-	// commit or roll back together.
-	if err := RecordPlatformProcessedVolume(ctx, tx, platformProcessedFils, int64(batchGross)); err != nil {
+	// commit or roll back together. Captured volume only: a refund is not
+	// "processed volume" for the tier.
+	if err := RecordPlatformProcessedVolume(ctx, tx, platformProcessedFils, int64(captureGross)); err != nil {
 		return BatchResult{}, fmt.Errorf("settlement: CloseBatch: record platform volume: %w", err)
 	}
 
@@ -246,15 +296,40 @@ func CloseBatch(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, bus
 			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: mark events batched: %w", err)
 		}
 	}
+	if len(refundIDs) > 0 {
+		_, err = tx.Exec(ctx, `
+			UPDATE refunds SET settlement_batch_id = $2 WHERE id = ANY($1)
+		`, refundIDs, batchID)
+		if err != nil {
+			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: mark refunds batched: %w", err)
+		}
+	}
 
 	for i, line := range lines {
 		truncated := TruncateToSchemeAmount(line.grossFils)
 		_, err = tx.Exec(ctx, `
 			INSERT INTO scheme_export_lines (settlement_batch_id, transaction_id, amount_fils, amount, line_sequence)
-			VALUES ($1, $2, $3, $4, $5)
-		`, batchID, line.transactionID, int64(truncated), SchemeAmountBD(line.grossFils), i+1)
+			VALUES ($1, $2, $3, $4::numeric, $5)
+		`, batchID, line.transactionID, int64(truncated), SchemeAmountBD(truncated), i+1)
 		if err != nil {
 			return BatchResult{}, fmt.Errorf("settlement: CloseBatch: insert scheme export line: %w", err)
+		}
+
+		// ADR-0002: journal the 0–9 fils the scheme never sees, per line, in
+		// the same transaction as the export line. The ADR says this was
+		// implemented in March; it never was, so the residue sat unexplained
+		// in card_scheme_clearing.
+		if residue := line.grossFils - truncated; residue > 0 {
+			_, err = tx.Exec(ctx, `
+				INSERT INTO ledger_entries
+				  (entry_group_id, merchant_id, transaction_id, settlement_batch_id, account_id, direction, amount_fils, occurred_at, description)
+				VALUES
+				  ($1, $2, $3, $4, 'scheme_rounding_residue', 'debit',  $5, now(), 'scheme export: rounding residue'),
+				  ($1, $2, $3, $4, 'card_scheme_clearing',    'credit', $5, now(), 'scheme export: rounding residue')
+			`, uuid.New(), merchantID, line.transactionID, batchID, int64(residue))
+			if err != nil {
+				return BatchResult{}, fmt.Errorf("settlement: CloseBatch: post scheme residue: %w", err)
+			}
 		}
 	}
 
@@ -400,6 +475,15 @@ type MerchantBatchOutcome struct {
 // between concurrent goroutines each trying to FOR UPDATE a
 // settlement_batches row.
 func RunDailyBatch(ctx context.Context, db *pgxpool.Pool, businessDate time.Time, onlyMerchant *uuid.UUID) (DailyBatchReport, error) {
+	// Only a business day that is already over can be closed. Closing today
+	// (or a future day) early froze the batch, and CloseBatch never reopens a
+	// closed batch — every capture later that day was stranded, never settled.
+	// The CLI and the admin "run batch" button both accepted any date.
+	if _, end := BusinessDayWindow(businessDate); time.Now().Before(end) {
+		return DailyBatchReport{}, fmt.Errorf("settlement: RunDailyBatch: business day %s has not ended yet (ends %s)",
+			businessDate.Format("2006-01-02"), end.UTC().Format(time.RFC3339))
+	}
+
 	var merchantIDs []uuid.UUID
 	if onlyMerchant != nil {
 		merchantIDs = []uuid.UUID{*onlyMerchant}

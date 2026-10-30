@@ -2,8 +2,8 @@
  * Tests for the refund processor against a real, migrated Postgres (no DB
  * mocking). Requires `DATABASE_URL` (run `npm run migrate` first).
  *
- * There is no route to `inject` against yet — `POST /v1/refunds` is still a
- * 501 stub — so these call `processRefund()` directly. The transactions they
+ * These call `processRefund()` directly; the route-level refund tests live in
+ * routes/transactions.test.ts. The transactions they
  * refund are set up through the real authorize/capture routes, so the ledger
  * and fee state under test is the state capture actually produces.
  */
@@ -477,4 +477,74 @@ test("unknown transaction ids answer 404", async () => {
   });
   assert.equal(result.statusCode, 404);
   assert.deepEqual(result.body, { error: "transaction_not_found" });
+});
+
+// ---------------------------------------------------------------------------
+// Fee reversal correctness (FP-300). Per-refund rounding used to drift: three
+// refunds of a third reversed 83 + 83 + 83 = 249 of a 250 fee, and a
+// negotiated discount was ignored so the gross (pre-discount) fee went back.
+// ---------------------------------------------------------------------------
+
+test("partial refunds reverse, in total, exactly the fee that was charged", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-fee-drift", 250);
+  const txn = await capturedTransaction(merchant.rawKey, 10_000);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  for (const amount of [3_333, 3_333, 3_334]) {
+    const result = await processRefund(pool, approvingAcquirer, {
+      transactionId: txn.id,
+      merchantId: merchant.merchantId,
+      amountFils: toFils(amount),
+      idempotencyKey: randomUUID(),
+      actor,
+    });
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+  }
+
+  const reversed = await pool.query<{ total: string }>(
+    `SELECT SUM(fee_reversed_fils)::text AS total FROM refunds WHERE transaction_id = $1`,
+    [txn.id],
+  );
+  assert.equal(Number(reversed.rows[0]!.total), 250);
+});
+
+test("a discounted merchant's refund reverses the net fee it paid, not the gross MDR", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-discounted", 250);
+  // 20% off the fee: 250 MDR on 10.000 BD, 50 credited back after capture.
+  await pool.query(`UPDATE merchants SET negotiated_discount_bps = 2000 WHERE id = $1`, [merchant.merchantId]);
+  const txn = await capturedTransaction(merchant.rawKey, 10_000);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  const result = await processRefund(pool, approvingAcquirer, {
+    transactionId: txn.id,
+    merchantId: merchant.merchantId,
+    idempotencyKey: randomUUID(),
+    actor,
+  });
+  assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+  assert.equal((result.body as { feeReversedFils: number }).feeReversedFils, 200);
+
+  // Fully refunded: fee revenue on this transaction nets to exactly zero.
+  const net = await pool.query<{ net: string }>(
+    `SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_fils ELSE -amount_fils END), 0)::text AS net
+       FROM ledger_entries WHERE transaction_id = $1 AND account_id = 'platform_fee_revenue'`,
+    [txn.id],
+  );
+  assert.equal(Number(net.rows[0]!.net), 0);
+});
+
+test("a refund with no reason is stored as 'unspecified' (0070 forbids NULL)", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-no-reason");
+  const txn = await capturedTransaction(merchant.rawKey, 1_000);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  const result = await processRefund(pool, approvingAcquirer, {
+    transactionId: txn.id,
+    merchantId: merchant.merchantId,
+    idempotencyKey: randomUUID(),
+    actor,
+  });
+  assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+  const row = await pool.query<{ reason: string }>(`SELECT reason FROM refunds WHERE transaction_id = $1`, [txn.id]);
+  assert.equal(row.rows[0]!.reason, "unspecified");
 });

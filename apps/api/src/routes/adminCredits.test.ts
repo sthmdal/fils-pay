@@ -136,7 +136,22 @@ test("every credits route rejects an unauthenticated caller", async () => {
   }
 });
 
-// create isn't in this test, only approve/reject. intentional? — am
+test("a support admin is 403'd on CREATING a credit — below the threshold it posts immediately", async () => {
+  const support = await signedInAdmin("support", "gate-create");
+  const merchantId = await createMerchant("gate-create");
+
+  const res = await app.inject({
+    method: "POST",
+    url: `/v1/admin/merchants/${merchantId}/credits`,
+    headers: { cookie: support.cookie },
+    payload: { reasonCode: "goodwill", effectiveDate: todayIso(), baseAmountFils: 1_000 },
+  });
+  assert.equal(res.statusCode, 403, res.body);
+
+  const rows = await pool.query(`SELECT 1 FROM credit_requests WHERE merchant_id = $1`, [merchantId]);
+  assert.equal(rows.rowCount, 0);
+});
+
 test("a support admin is 403'd on approve and reject — the decision that moves money", async () => {
   const finance = await signedInAdmin("finance", "gate-maker");
   const support = await signedInAdmin("support", "gate-checker");

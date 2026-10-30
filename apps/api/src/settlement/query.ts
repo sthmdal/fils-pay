@@ -1,4 +1,5 @@
 import type { Pool } from "pg";
+import { applyRateFils, toFils } from "@filspay/money";
 import { estimateFeeFils } from "../fees/estimate.js";
 
 const DEFAULT_LIMIT = 25;
@@ -248,8 +249,9 @@ export async function listBatchTransactions(
 
 /**
  * gapFils = ledgerMerchantPayableNetFils - settlementNetPayoutFils -
- * pendingUnbatchedFils. Refund legs are included both in the ledger figure
- * and in pending, so a period with refunds still explains to zero.
+ * pendingUnbatchedFils. Refund legs are in the ledger figure; a batched
+ * refund is netted into its batch's net_payout_fils, an unbatched one into
+ * pending, so a period with refunds still explains to zero.
  */
 export interface ReconciliationReport {
   periodFrom: string;
@@ -285,11 +287,16 @@ export async function getReconciliationReport(
   const windowStart = bahrainLocalMidnightUtc(input.from);
   const windowEnd = bahrainLocalMidnightUtc(input.to);
 
-  const [ledgerResult, settlementResult, pendingResult, merchantResult] = await Promise.all([
+  const [ledgerResult, settlementResult, pendingResult, merchantResult, pendingRefundResult] = await Promise.all([
+    // Activity only: the payout legs (PayoutBatch / PayoutSplitBatch, both
+    // described "settlement payout: ...") are how the settled figure leaves
+    // the account, not activity to explain — counting them made any window
+    // that contains a payout look like an unexplained gap.
     pool.query<{ net: string }>(
       `SELECT COALESCE(SUM(CASE WHEN direction = 'credit' THEN amount_fils ELSE -amount_fils END), 0) AS net
          FROM ledger_entries
         WHERE merchant_id = $1 AND account_id = 'merchant_payable'
+          AND COALESCE(description, '') NOT LIKE 'settlement payout:%'
           AND occurred_at >= $2 AND occurred_at < $3`,
       [input.merchantId, windowStart, windowEnd],
     ),
@@ -300,8 +307,8 @@ export async function getReconciliationReport(
           AND status IN ('closed', 'paid')`,
       [input.merchantId, input.from, input.to],
     ),
-    pool.query<{ amount_fils: string | number }>(
-      `SELECT te.amount_fils
+    pool.query<{ amount_fils: string | number; fee_fils: string | number | null }>(
+      `SELECT te.amount_fils, te.metadata->>'feeFils' AS fee_fils
          FROM transaction_events te
          JOIN transactions t ON t.id = te.transaction_id
         WHERE t.merchant_id = $1 AND te.event_type IN ('captured', 'partially_captured')
@@ -313,10 +320,22 @@ export async function getReconciliationReport(
       `SELECT mdr_bps, negotiated_discount_bps FROM merchants WHERE id = $1`,
       [input.merchantId],
     ),
+    // FP-300: refunds not yet netted into a batch. Each already moved
+    // merchant_payable by -amount + fee_reversed when it happened.
+    pool.query<{ net: string }>(
+      `SELECT COALESCE(SUM(fee_reversed_fils - amount_fils), 0) AS net
+         FROM refunds
+        WHERE merchant_id = $1 AND status = 'succeeded'
+          AND settlement_batch_id IS NULL
+          AND occurred_at >= $2 AND occurred_at < $3`,
+      [input.merchantId, windowStart, windowEnd],
+    ),
   ]);
 
-  // MK: merchants.mdr_bps is kept in sync with the current fee_schedules row by the 0046 trigger,
-  // so reading it here is the same as resolving the schedule
+  // There is no trigger keeping merchants.mdr_bps in sync with fee_schedules
+  // (0046 is settlement_batch_splits). The fee each pending capture was
+  // actually charged is on its own event (metadata.feeFils, written by
+  // capture.ts); only events without it fall back to the merchant's rate.
   const merchant = merchantResult.rows[0];
   const mdrBps = merchant?.mdr_bps ?? 0;
   const discountBps = merchant?.negotiated_discount_bps ?? 0;
@@ -324,9 +343,16 @@ export async function getReconciliationReport(
   let pendingUnbatchedFils = 0;
   for (const row of pendingResult.rows) {
     const amountFils = Number(row.amount_fils);
-    const feeFils = estimateFeeFils(amountFils, mdrBps, discountBps);
+    let feeFils: number;
+    if (row.fee_fils !== null && row.fee_fils !== undefined) {
+      const charged = toFils(Number(row.fee_fils));
+      feeFils = charged - applyRateFils(charged, discountBps);
+    } else {
+      feeFils = estimateFeeFils(amountFils, mdrBps, discountBps);
+    }
     pendingUnbatchedFils += amountFils - feeFils;
   }
+  pendingUnbatchedFils += Number(pendingRefundResult.rows[0]?.net ?? 0);
 
   const ledgerMerchantPayableNetFils = Number(ledgerResult.rows[0]?.net ?? 0);
   const settlementNetPayoutFils = Number(settlementResult.rows[0]?.total ?? 0);
@@ -364,8 +390,12 @@ export async function getSettlementSummary(
   const windowEnd = bahrainLocalMidnightUtc(input.to);
 
   const result = await pool.query<SettlementSummaryRow>(
+    // Per-event deltas, never transactions.captured_fils (a running total):
+    // summing the total once per joined event double-counted every
+    // partially captured transaction and pulled in captures from outside
+    // the window.
     `WITH captured AS (
-       SELECT t.id, t.captured_fils
+       SELECT t.id, te.amount_fils
          FROM transactions t
          JOIN transaction_events te ON te.transaction_id = t.id
         WHERE t.merchant_id = $1
@@ -373,7 +403,7 @@ export async function getSettlementSummary(
           AND te.occurred_at >= $2 AND te.occurred_at < $3
      )
      SELECT COUNT(DISTINCT id) AS transaction_count,
-            COALESCE(SUM(captured_fils), 0) AS total_captured_fils
+            COALESCE(SUM(amount_fils), 0) AS total_captured_fils
        FROM captured`,
     [input.merchantId, windowStart, windowEnd],
   );

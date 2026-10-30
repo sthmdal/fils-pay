@@ -2,8 +2,7 @@
  * Tests for the merchant-scoped refund entry point against a real, migrated
  * Postgres. Requires `DATABASE_URL` (run `npm run migrate` first).
  *
- * The route is not registered yet (`POST /v1/refunds` is still a 501 stub),
- * so these call the module directly — including `assertRefundRequestScope`,
+ * These call the module directly — including `assertRefundRequestScope`,
  * which is the check the route performs before handing over.
  */
 import assert from "node:assert/strict";
@@ -167,8 +166,29 @@ test("a partial refund of the caller's own transaction succeeds", async () => {
   assert.equal(Number(row.rows[0]!.refunded_fils), 2_500);
 });
 
-// TODO: another merchant's existing transactionId should also 404. currently refunds it — am
-// FH: Claude wrote a test for this but it passed?? so it's fine. deleted it as redundant
+test("another merchant's existing transactionId is a 404 and writes no refund", async () => {
+  const owner = await createApprovedMerchantWithApiKey("cross-owner");
+  const intruder = await createApprovedMerchantWithApiKey("cross-intruder");
+  const transactionId = await capturedTransaction(owner.rawKey, 5_000);
+
+  await assert.rejects(
+    () =>
+      initiateMerchantRefund(pool, approvingAcquirer, {
+        merchantId: intruder.merchantId,
+        transactionId,
+        idempotencyKey: randomUUID(),
+        actor: intruder.actor,
+      }),
+    NotFoundError,
+  );
+
+  const refunds = await pool.query<{ c: number }>(
+    `SELECT COUNT(*)::int AS c FROM refunds WHERE transaction_id = $1`,
+    [transactionId],
+  );
+  assert.equal(refunds.rows[0]!.c, 0);
+});
+
 test("a transactionId that does not exist is a 404, not a 500", async () => {
   const merchant = await createApprovedMerchantWithApiKey("missing-txn");
 

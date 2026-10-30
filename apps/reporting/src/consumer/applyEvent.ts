@@ -144,30 +144,28 @@ async function applyBatchClosed(client: PoolClient, row: OutboxEventRow): Promis
       `SELECT captured_count FROM merchant_daily_volume WHERE merchant_id = $1 AND volume_date = $2`,
       [payload.merchantId, payload.batchDate],
     );
-    const rollup = rollupResult.rows[0] as { captured_count: number };
-    if (rollup.captured_count < groundTruthCount) {
+    // A missing rollup row is the lag this check exists to report, not a
+    // reason to throw: a throw here rolls back the pass and the same event
+    // is re-selected forever, halting all reporting.
+    const rollupCount = Number((rollupResult.rows[0] as { captured_count: number } | undefined)?.captured_count ?? 0);
+    if (rollupCount < groundTruthCount) {
       console.warn(
         `reporting rollup lags ground truth for merchant ${payload.merchantId} on ${payload.batchDate}: ` +
-          `rollup=${rollup.captured_count} ground_truth=${groundTruthCount}`,
+          `rollup=${rollupCount} ground_truth=${groundTruthCount}`,
       );
     }
   }
 }
 
-
 /**
- * Rolls up a running daily refund summary, keyed by calendar date.
- * Called from the refund event path once refund events are wired into
- * the outbox (the consumer SELECT in runConsumerPass will include
- * "transaction.refunded" once the refund flow lands).
+ * refund.succeeded — per-refund delta from processRefund's outbox payload,
+ * bucketed by the same Asia/Bahrain business date as captures (the old
+ * draft used the UTC date, which put 00:00–03:00 refunds on the wrong day).
+ * Columns added by migration 0073.
  */
-export async function applyDailySummaryRollup(
-  client: PoolClient,
-  merchantId: string,
-  occurredAt: Date,
-  amountFils: number,
-): Promise<void> {
-  const summaryDate = occurredAt.toISOString().slice(0, 10);
+async function applyRefundSucceeded(client: PoolClient, row: OutboxEventRow): Promise<void> {
+  const payload = row.payload as { merchantId: string; amountFils: number };
+  const summaryDate = toBahrainDateString(row.created_at);
   await client.query(
     `INSERT INTO merchant_daily_volume (merchant_id, volume_date, refund_count, refund_gross_fils, last_updated_at)
      VALUES ($1, $2, 1, $3, now())
@@ -175,7 +173,7 @@ export async function applyDailySummaryRollup(
        SET refund_count = merchant_daily_volume.refund_count + 1,
            refund_gross_fils = merchant_daily_volume.refund_gross_fils + EXCLUDED.refund_gross_fils,
            last_updated_at = now()`,
-    [merchantId, summaryDate, amountFils],
+    [payload.merchantId, summaryDate, payload.amountFils],
   );
 }
 
@@ -196,6 +194,8 @@ export async function applyEvent(client: PoolClient, row: OutboxEventRow): Promi
       return applyTransactionVoided(client, row);
     case "settlement.batch_closed":
       return applyBatchClosed(client, row);
+    case "refund.succeeded":
+      return applyRefundSucceeded(client, row);
     default:
       throw new Error(`applyEvent: unhandled event_type ${row.event_type}`);
   }

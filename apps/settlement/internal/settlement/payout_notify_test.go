@@ -83,7 +83,33 @@ func TestEnqueuePayoutNotificationsEnqueuesOnePerPaidBatch(t *testing.T) {
 	}
 }
 
-// FH: sequential re-run only, concurrent run not covered. todo
+// Incident 2026-08-21: the daemon and a run-batch scanning at the same time.
+func TestEnqueuePayoutNotificationsConcurrentRunsEnqueueOnce(t *testing.T) {
+	pool := mustPool(t)
+	ctx := context.Background()
+
+	merchantID := insertActiveMerchant(t, pool, 250)
+	paidBatch := insertBatch(t, pool, merchantID, time.Date(2026, 3, 6, 0, 0, 0, 0, time.UTC), "paid", 33_000)
+
+	const runners = 4
+	errs := make(chan error, runners)
+	for i := 0; i < runners; i++ {
+		go func() {
+			_, err := EnqueuePayoutNotifications(ctx, pool)
+			errs <- err
+		}()
+	}
+	for i := 0; i < runners; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("EnqueuePayoutNotifications: %v", err)
+		}
+	}
+
+	if got := countPaidEvents(t, pool, paidBatch); got != 1 {
+		t.Fatalf("concurrent scans must enqueue exactly 1 settlement.paid event, got %d", got)
+	}
+}
+
 func TestEnqueuePayoutNotificationsIsIdempotent(t *testing.T) {
 	pool := mustPool(t)
 	ctx := context.Background()

@@ -13,6 +13,19 @@ test("an empty amount throws", () => {
   assert.throws(() => parseAdjustmentAmountFils(""), /could not parse amount/);
 });
 
+// Finance's Sep 17 report: "4.755 shows 4.750" and "4.75 shows 0.475 (10x)".
+test("BD amounts parse to fils at 1 BD = 1000 fils, keeping the third decimal", () => {
+  assert.equal(parseAdjustmentAmountFils("4.755"), 4_755);
+  assert.equal(parseAdjustmentAmountFils("4.75"), 4_750);
+  assert.equal(parseAdjustmentAmountFils("4.750"), 4_750);
+  assert.equal(parseAdjustmentAmountFils("-1.250"), -1_250);
+  assert.equal(parseAdjustmentAmountFils("12"), 12_000);
+});
+
+test("more than three decimals is rejected, not truncated", () => {
+  assert.throws(() => parseAdjustmentAmountFils("4.7555"), /could not parse amount/);
+});
+
 // ------------------------------------------------------------ csv splitting
 
 const MERCHANT_A = "11111111-1111-4111-8111-111111111111";

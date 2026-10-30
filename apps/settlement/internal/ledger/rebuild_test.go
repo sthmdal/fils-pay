@@ -107,7 +107,8 @@ func TestRebuildMerchantBalance_ZeroActivity(t *testing.T) {
 	}
 }
 
-// FH: duplicate of the export test? delete one rebuild impl -- claude suggests keeping FromExport as "more authoritative"
+// The ledger is the source of truth; the scheme-export-based refresh that
+// backed the console button (refresh.go) was removed (FP-203).
 func TestRebuildAllBalances_OverwritesDriftedCache(t *testing.T) {
 	pool := mustPool(t)
 	merchantID := insertActiveMerchant(t, pool)

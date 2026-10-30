@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { Pool, PoolClient } from "pg";
 import { withTransaction } from "../db/withTransaction.js";
 import { ConflictError, NotFoundError } from "../lib/errors.js";
@@ -21,17 +20,14 @@ export interface OriginalDelivery {
  * both the merchant-facing single-delivery replay route and the admin
  * batch-replay function — so the two can never mean different things.
  *
- * Re-signs with a fresh timestamp and a fresh delivery_event_id rather than
- * resending the original bytes verbatim: this platform's signature scheme
- * binds a `t=` timestamp specifically so a receiver can enforce freshness,
- * and a stale replay would near-certainly fail that check. A replay is also,
- * from a receiver's dedupe perspective, legitimately a new delivery attempt
- * of the same underlying event — reusing the original delivery_event_id
- * would make a receiver that already processed the original silently swallow
- * the replay too. The stored envelope's own `id` field is updated to match
- * (data/type/createdAt carried over unchanged), so a receiver deduping from
- * either the Webhook-Delivery-Id header or the parsed body gets a consistent
- * answer.
+ * Re-signs with a fresh timestamp (the dispatcher signs at send time), but
+ * keeps the ORIGINAL delivery_event_id. That id is the receiver's dedupe key
+ * (0022's column comment, ARCHITECTURE §Events, and the 1.9.1 changelog all
+ * tell merchants to dedupe on Webhook-Delivery-Id). Minting a new id per
+ * replay made every replay — including the admin batch replay after
+ * incident 2026-08-21 — look like a brand-new event, so receivers acted on
+ * the same settlement.paid twice. A receiver that never got the original
+ * processes the replay; one that already did correctly ignores it.
  *
  * The original row (payload + signature) is never mutated — forensic value
  * is preserved there, not by resending its exact bytes.
@@ -43,10 +39,15 @@ export async function insertReplayDeliveryRow(
   client: PoolClient,
   original: OriginalDelivery,
 ): Promise<ReplayResult> {
-  // MK: new id per replay on purpose, receivers dedupe on the original id in the body
-  // FH: ARCH §5 says Webhook-Delivery-Id is stable across retries and replays — this mints a new one?
-  const newDeliveryEventId = randomUUID();
-  const replayPayload = { ...original.payload, id: newDeliveryEventId };
+  const originalDeliveryEventId = await client.query<{ delivery_event_id: string }>(
+    `SELECT delivery_event_id FROM webhook_deliveries WHERE id = $1`,
+    [original.id],
+  );
+  const deliveryEventId = originalDeliveryEventId.rows[0]?.delivery_event_id;
+  if (!deliveryEventId) {
+    throw new NotFoundError("webhook_delivery_not_found");
+  }
+  const replayPayload = { ...original.payload, id: deliveryEventId };
 
   const insertResult = await client.query<{ id: string; status: string }>(
     `INSERT INTO webhook_deliveries
@@ -57,7 +58,7 @@ export async function insertReplayDeliveryRow(
       original.endpointId,
       original.outboxEventId,
       original.eventType,
-      newDeliveryEventId,
+      deliveryEventId,
       JSON.stringify(replayPayload),
       original.id,
     ],

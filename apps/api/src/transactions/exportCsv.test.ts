@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, test } from "node:test";
 import { Pool } from "pg";
-import { buildTransactionsExportCsv } from "./exportCsv.js";
+import { buildTransactionsExportCsv, streamTransactionsExportCsv } from "./exportCsv.js";
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) {
@@ -177,7 +177,40 @@ test("a status filter narrows to the listed statuses", async () => {
   assert.equal(all.split("\n").length, 3);
 });
 
-// no test for a reference starting with "=" — am
+test("a reference starting with = is neutralised so a spreadsheet won't run it as a formula", async () => {
+  const merchantId = await createMerchant();
+  await insertTransaction(merchantId, {
+    status: "captured",
+    amountFils: 1000,
+    capturedFils: 1000,
+    reference: "=HYPERLINK(\"http://x\")",
+    occurredAt: "2026-04-01T00:00:00Z",
+  });
+
+  const csv = await buildTransactionsExportCsv(pool, { merchantId });
+  assert.ok(!csv.split("\n")[1]!.split(",")[4]!.startsWith("="));
+});
+
+test("the streamed export (what the route serves) has the same rows as the in-memory builder", async () => {
+  const merchantId = await createMerchant();
+  for (let i = 0; i < 3; i++) {
+    await insertTransaction(merchantId, {
+      status: "captured",
+      amountFils: 1000 + i,
+      capturedFils: 1000 + i,
+      reference: `same-ts-${i}`,
+      occurredAt: "2026-04-01T00:00:00Z", // identical timestamps: the keyset must not skip ties
+    });
+  }
+
+  let streamed = "";
+  await streamTransactionsExportCsv(pool, { merchantId }, (chunk) => {
+    streamed += chunk;
+  });
+  const built = await buildTransactionsExportCsv(pool, { merchantId });
+  assert.equal(streamed.trimEnd().split("\n").sort().join("\n"), built.split("\n").sort().join("\n"));
+});
+
 test("a reference containing a comma or a quote is CSV-escaped", async () => {
   const merchantId = await createMerchant();
   await insertTransaction(merchantId, {

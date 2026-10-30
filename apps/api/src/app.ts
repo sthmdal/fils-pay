@@ -11,7 +11,7 @@ import { businessProfileRoutes } from "./routes/businessProfile.js";
 import { kycRoutes } from "./routes/kyc.js";
 import { apiKeyRoutes } from "./routes/apiKeys.js";
 import { transactionRoutes } from "./routes/transactions.js";
-import { refundRoutes } from "./routes/refunds.js";
+import { refundMerchantRoutes, refundRoutes } from "./routes/refunds.js";
 import { paymentLinkMerchantRoutes, paymentLinkPublicRoutes } from "./routes/paymentLinks.js";
 import { webhookEndpointRoutes } from "./routes/webhooks.js";
 import { settlementRoutes } from "./routes/settlement.js";
@@ -57,10 +57,9 @@ export function buildApp(config: Config, pool: Pool, options: BuildAppOptions = 
   app.register(apiKeyRoutes, { prefix: "/v1/merchants" });
   // v1/routes/transactions.ts is NOT this one. that tree is dead — MK
   app.register(transactionRoutes, { prefix: "/v1/transactions" });
-  // FP-212: RefundDrawer posts to /v1/merchants/:id/refunds, initiateMerchantRefund expects
-  // that path too. this prefix is the old stub — am
-  // MK: keep /v1/refunds, API.md documents it. the drawer is wrong
-  // FH: API.md has both?? asked in #eng, no answer yet (12/10/2026)
+  // FP-300: both paths are served by the same handler. The merchant-scoped one
+  // is what the dashboard drawer uses; /v1/refunds stays for API clients.
+  app.register(refundMerchantRoutes, { prefix: "/v1/merchants" });
   app.register(refundRoutes, { prefix: "/v1/refunds" });
   app.register(paymentLinkMerchantRoutes, { prefix: "/v1/merchants" });
   app.register(paymentLinkPublicRoutes, { prefix: "/v1/payment-links" });

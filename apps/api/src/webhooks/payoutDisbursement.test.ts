@@ -37,7 +37,22 @@ async function createPaidBatch(netPayoutFils: number): Promise<string> {
   return batch.rows[0]!.id;
 }
 
-// FH: only checks the insert, not who calls it or how often
+test("recording the effect twice (two endpoints, a replay) still leaves one instruction per batch", async () => {
+  const batchId = await createPaidBatch(120_000);
+
+  await Promise.all([
+    recordPayoutDisbursementEffect(pool, batchId, 120_000),
+    recordPayoutDisbursementEffect(pool, batchId, 120_000),
+  ]);
+  await recordPayoutDisbursementEffect(pool, batchId, 120_000);
+
+  const result = await pool.query<{ c: number }>(
+    `SELECT COUNT(*)::int AS c FROM settlement_payout_disbursements WHERE settlement_batch_id = $1`,
+    [batchId],
+  );
+  assert.equal(result.rows[0]!.c, 1);
+});
+
 test("recordPayoutDisbursementEffect inserts one row with the given batch id and amount", async () => {
   const batchId = await createPaidBatch(471_300);
 

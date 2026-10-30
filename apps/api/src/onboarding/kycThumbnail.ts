@@ -27,9 +27,11 @@ export async function generateKycThumbnail(
   if (detectedType !== "jpeg" && detectedType !== "png") {
     return null;
   }
-  // YA: the 8 MiB upload cap protects us here
-  // FH: sharp's default pixel limit is ~268MP, a tiny png can decode huge. copilot suggests limitInputPixels
-  const resized = await sharp(buffer)
+  // The 8 MiB upload cap limits the COMPRESSED size only: a small PNG can
+  // declare 20000x20000 pixels and decode to gigabytes (sharp's default cap
+  // is ~268MP), taking the 512 MB API down. A scanned ID or letter is well
+  // under 40MP; anything bigger is rejected by sharp before decoding.
+  const resized = await sharp(buffer, { limitInputPixels: 40_000_000 })
     .resize(THUMBNAIL_MAX_DIMENSION_PX, THUMBNAIL_MAX_DIMENSION_PX, { fit: "inside", withoutEnlargement: true })
     .jpeg({ quality: 70 })
     .toBuffer();

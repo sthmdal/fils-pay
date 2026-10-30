@@ -132,8 +132,6 @@ export async function listApiKeys(pool: Pool, merchantId: string): Promise<ApiKe
 
 /** Always merchant-scoped by construction — revoking another merchant's key
  *  by guessing an ID must be impossible, not merely disallowed by convention. */
-// FH: admin rotation (admin/apiKeys.ts) should call this — it doesn't
-// it does, around line 47 — am
 export async function revokeApiKey(pool: Pool, merchantId: string, apiKeyId: string): Promise<boolean> {
   const result = await pool.query(
     `UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND merchant_id = $2 AND revoked_at IS NULL`,

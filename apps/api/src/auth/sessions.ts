@@ -74,7 +74,10 @@ export interface AuthenticatedSessionLookup {
   role: "owner" | "finance" | "support";
 }
 
-/** Resolves a session token to its user. */
+/** Resolves a session token to its user. Only OTP-verified sessions count:
+ *  live_sessions (0058) filters revoked/expired but not `authenticated`, so
+ *  without the explicit check the pre-OTP cookie from step 1 of login was a
+ *  full session ("login works without entering the OTP code"). */
 export async function lookupSession(
   pool: Pool,
   rawToken: string,
@@ -89,7 +92,8 @@ export async function lookupSession(
     `SELECT s.id AS session_id, s.merchant_user_id, mu.merchant_id, mu.role
        FROM live_sessions s
        JOIN merchant_users mu ON mu.id = s.merchant_user_id
-      WHERE s.token_hash = $1`,
+      WHERE s.token_hash = $1
+        AND s.authenticated = true`,
     [tokenHash],
   );
   const row = result.rows[0];

@@ -59,8 +59,13 @@ export async function adminCreditRoutes(app: FastifyInstance): Promise<void> {
       },
     );
 
+    // Creating a credit moves money: at or under the threshold it posts to
+    // the ledger immediately. createCreditRequest's doc says support gets a
+    // 403 "from here", but nothing enforced it — any support operator could
+    // credit up to the threshold, as many times as they liked.
     scope.post<{ Params: MerchantIdParams; Body: unknown }>(
       "/merchants/:id/credits",
+      { preHandler: requireAdminRole("finance", "super_admin") },
       async (request, reply) => {
         const adminAuth = request.adminAuth;
         if (!adminAuth) throw new UnauthorizedError("unauthenticated");

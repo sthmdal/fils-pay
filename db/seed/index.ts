@@ -30,6 +30,18 @@ async function main(): Promise<void> {
   const pool = new Pool({ connectionString: databaseUrl, max: 5 });
 
   try {
+    // generate() runs TRUNCATE ... RESTART IDENTITY CASCADE over every core
+    // table — effectively the whole database, not "its own fixture tables"
+    // as the old compose/RUNBOOK notes claimed. Refuse to do that to a
+    // database that already holds merchants unless explicitly told to.
+    const existing = await pool.query<{ n: string }>(`SELECT count(*)::text AS n FROM merchants`);
+    if (Number(existing.rows[0]?.n ?? 0) > 0 && process.env.SEED_ALLOW_WIPE !== "yes") {
+      throw new Error(
+        "seed: refusing to run — this database already has merchants and the seed TRUNCATEs every table. " +
+          "Set SEED_ALLOW_WIPE=yes only for a disposable database.",
+      );
+    }
+
     const summary = await generate(pool);
     console.log(
       `seed: generated ${summary.merchantCount} merchants, ${summary.merchantUserCount} merchant_users, ` +

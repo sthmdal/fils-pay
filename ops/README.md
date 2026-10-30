@@ -1,72 +1,67 @@
 # ops/
 
-Local development stack for FilsPay: Postgres plus the three services that
-talk to it directly (apps/api, apps/settlement, apps/reporting). The hosted
-demo instance uses the same compose file with a different `.env`.
+The FilsPay stack: Postgres plus the three services that talk to it directly
+(apps/api, apps/settlement, apps/reporting). apps/web and apps/admin are
+static Vite front-ends that call apps/api over HTTP.
 
 ## Quick start
 
 ```
-docker compose -f ops/docker-compose.yml up -d postgres
-docker compose -f ops/docker-compose.yml run --rm migrate
-docker compose -f ops/docker-compose.yml run --rm seed
-docker compose -f ops/docker-compose.yml up api settlement reporting
+cp ops/.env.example ops/.env          # fill in real secrets first
+docker compose -f ops/docker-compose.yml up -d --build
 ```
 
-apps/web and apps/admin aren't part of this compose file — they're plain
-Vite dev servers that talk to apps/api over HTTP (`npm run dev` inside
-each package), not services with their own database connection.
+`up` starts Postgres, runs `migrate` once, then starts api, settlement and
+reporting (each waits for migrate to succeed). It does **not** seed.
+
+Seed a brand-new, empty database only:
+
+```
+docker compose -f ops/docker-compose.yml --profile seed run --rm seed
+```
+
+## Commands that destroy data — do not run against real data
+
+| Command | Why |
+|---|---|
+| `seed` (`npm run seed`) | `TRUNCATE ... RESTART IDENTITY CASCADE` on every core table — effectively the whole database. Now refuses if merchants exist unless `SEED_ALLOW_WIPE=yes`. |
+| `docker compose ... down -v` | `-v` deletes the `filspay_pgdata` volume. |
+| `npm test` / `go test ./...` | integration tests write to and delete from the database in `DATABASE_URL`. |
+| `reporting rebuild` | truncates the rollup tables before replaying. |
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `docker-compose.yml` | the stack |
-| `.env.docker` | shared service settings, loaded by compose for every service |
-| `Dockerfile.node` | image for api, reporting, migrate and seed (`node:20`, full install) |
-| `Dockerfile.go` | multi-stage build of `apps/settlement` |
+| `docker-compose.yml` | the stack (restart policies, memory limits, healthchecks) |
+| `.env.example` | template for `ops/.env` (gitignored): secrets and settings |
+| `Dockerfile.node` | image for api, reporting, migrate and seed |
+| `Dockerfile.go` | multi-stage build of `apps/settlement` (static binary, distroless) |
 
-> **AM (July):** the two Dockerfiles aren't in the repo for me. built my own
->
-> **MK:** they were in the initial ops commit. check you're on main
+The old committed `.env.docker` held the acquirer signing secret and was not
+actually gitignored (`.env` does not match `.env.docker`). It is removed; the
+secret it contained must be treated as leaked and rotated.
 
 ## Database
 
-Every service, plus the one-off `migrate`/`seed` jobs, connects with the
-same `filspay` role and the same `DATABASE_URL`
-(`postgres://filspay:filspay_dev_password@postgres:5432/filspay?sslmode=disable`).
-One role keeps local setup to a single password instead of hand-rolling
-per-service grants for a stack this size. `sslmode=disable` is safe here:
-Postgres and every service run on the same Docker Compose bridge network,
-which never carries traffic outside the host, so there's no untrusted hop
-for a connection to cross.
+All services use one `filspay` role over the compose network with
+`sslmode=disable`; Postgres is published on `127.0.0.1` only. Per-service
+roles and TLS are still to do before handling real card data.
 
-The settlement worker can be given a second connection string,
-`PGCONN_SETTLEMENT`, for its batch-close pool. It only takes effect when
-`DATABASE_URL` is unset.
+`PGCONN_SETTLEMENT`, if set, overrides `DATABASE_URL` for the settlement
+worker (not the other way round, as this README used to say).
 
-To reset the database to a clean, freshly-seeded state at any point, re-run
-the `seed` job above — `db/seed/index.ts` truncates and regenerates its
-fixture tables on every invocation; it doesn't need the volume removed
-first.
+## Required settings
 
-## Required settings per service
-
-| Service | Needs | Where it comes from in compose |
-|---|---|---|
-| api | `DATABASE_URL`, `SETTLEMENT_INTERNAL_URL` | `environment:` |
-| api | `WEBHOOK_SECRET_ENCRYPTION_KEY` | only outside dev; a dev key is used otherwise |
-| api | `ACQUIRER_CALLBACK_SIGNING_SECRET`, `NODE_ENV` | `.env.docker` |
-| settlement | `DATABASE_URL` | `environment:` |
-| settlement | `SETTLEMENT_INTERNAL_TOKEN` | defaults to `dev-token` |
-| reporting | `DATABASE_URL` | `environment:`; runs `worker` by default |
-
-> **MK:** the api won't boot without WEBHOOK_SECRET_ENCRYPTION_KEY in any environment. set it on the hosted box.
+| Service | Needs |
+|---|---|
+| api | `DATABASE_URL`, `SETTLEMENT_INTERNAL_URL`, `SETTLEMENT_INTERNAL_TOKEN`, `WEBHOOK_SECRET_ENCRYPTION_KEY`, `ACQUIRER_CALLBACK_SIGNING_SECRET` |
+| settlement | `DATABASE_URL`, `SETTLEMENT_INTERNAL_TOKEN` (exits at boot without it — there is no `dev-token` fallback) |
+| reporting | `DATABASE_URL` |
 
 ## Resource sizing
 
-The hosted demo box is 0.5 vCPU / 2 GB RAM / 2 GB disk; the API container is
-limited to 512 MB. Postgres defaults are fine at this size. The settlement
-image is built on the box with `go build` from `Dockerfile.go`.
-
-> **AM:** first build on the box filled the disk (go build cache). cleared it and it went through on the second try
+Target box: 0.5 vCPU / 2 GB RAM / 2 GB disk. Memory limits: postgres 640 MB,
+api 512 MB, settlement 256 MB, reporting 256 MB. Build images off the box
+(or use the multi-stage Go build, whose toolchain never ships) — a `go build`
+on the box filled its disk before.

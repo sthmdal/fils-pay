@@ -120,7 +120,7 @@ func Handler(pool *pgxpool.Pool, cfg config.Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/internal/run-batch", requireBearerToken(cfg.InternalToken, requirePost(handleRunBatch(pool))))
 	mux.Handle("/internal/rebuild-balances", requireBearerToken(cfg.InternalToken, requirePost(handleRebuildBalances(pool))))
-	// FH: recalculate-mdr is 'safe' per ADMIN.md -- finance runs it after every rate change
+	// recalculate-mdr only ever touches CLOSED (unpaid) batches.
 	mux.Handle("/internal/recalculate-mdr", requireBearerToken(cfg.InternalToken, requirePost(handleRecalculateMDR(pool))))
 	return mux
 }
@@ -223,6 +223,12 @@ func handleRunBatch(pool *pgxpool.Pool) http.Handler {
 			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid_date"})
 			return
 		}
+		// Closing a day that hasn't ended strands the rest of its captures
+		// (RunDailyBatch refuses too; this just makes it a clear 400).
+		if _, end := settlement.BusinessDayWindow(businessDate); time.Now().Before(end) {
+			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "business_day_not_ended"})
+			return
+		}
 
 		var onlyMerchant *uuid.UUID
 		if body.MerchantID != "" {
@@ -263,9 +269,16 @@ func handleRunBatch(pool *pgxpool.Pool) http.Handler {
 
 // handleRebuildBalances backs the admin console's "Rebuild cached balances"
 // action. Takes no body; any body sent is ignored.
+//
+// FP-203: this used to call ledger.RefreshBalanceCache, which overwrote the
+// cache from the merchant_payable_position view — lifetime truncated scheme
+// export gross, with no fees, no payouts and no refunds. That is how Alpha
+// Retail went from 135K to 7K. The button now runs exactly what the
+// `rebuild-balances` CLI runs, from ledger_entries (the only source of truth),
+// as ARCHITECTURE and the handover describe.
 func handleRebuildBalances(pool *pgxpool.Pool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		diffs, err := ledger.RefreshBalanceCache(r.Context(), pool)
+		diffs, err := ledger.RebuildAllBalances(r.Context(), pool)
 		if err != nil {
 			log.Printf("settlement internal api: rebuild-balances failed: %v", err)
 			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "rebuild_balances_failed"})

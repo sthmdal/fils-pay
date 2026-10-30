@@ -24,10 +24,17 @@ func TruncateToSchemeAmount(grossFils money.Fils) money.Fils {
 	return (grossFils / 10) * 10
 }
 
-// SchemeAmountBD converts a transaction's gross fils to the BD value stored
-// in scheme_export_lines.amount (numeric(10,2)).
-func SchemeAmountBD(grossFils money.Fils) float64 {
-	return float64(grossFils) / 1000.0
+// SchemeAmountBD renders an already-truncated line amount as the exact
+// "D.DD" text stored in scheme_export_lines.amount (numeric(10,2)).
+//
+// It used to take the untruncated gross and return float64(gross)/1000:
+// NUMERIC(10,2) then ROUNDED that on assignment (1.235 -> 1.24), so the file
+// we sent the scheme was up to 9 fils higher than amount_fils on every line
+// — the "scheme statement is always a few fils over, never under" gap.
+// Truncate first, format with integer arithmetic, and the file equals the
+// fils figure exactly.
+func SchemeAmountBD(truncatedFils money.Fils) string {
+	return formatFilsAsTwoDecimalString(truncatedFils)
 }
 
 // buildBatchClosedPayload builds the settlement.batch_closed outbox

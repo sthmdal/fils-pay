@@ -44,8 +44,19 @@ type batchRow struct {
 	netPayoutFils money.Fils
 }
 
-// RecalculateMDR re-derives the fee on a merchant's closed batches in
-// [from, to) at the merchant's current terms and posts the difference.
+// RecalculateMDR re-derives the fee on a merchant's CLOSED (not yet paid)
+// batches in [from, to) and posts the difference.
+//
+// Two fixes against the finance report "MDR recalculation changed batches
+// that were already paid out":
+//   - Only status = 'closed'. The filter was `status <> 'open'`, which
+//     includes 'paid': a paid batch's frozen fee/net were rewritten after the
+//     money had already left, so statements no longer matched the bank.
+//   - Each event is re-rated exactly as CloseBatch rates it: the
+//     effective-dated fee_schedules row at the event's own time, minus the
+//     platform volume-tier bonus. It used to apply merchants.mdr_bps to
+//     everything, so a merchant on a schedule got a spurious diff on every
+//     run, and a later rate change was applied retroactively.
 func RecalculateMDR(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID, from, to time.Time) (RecalcResult, error) {
 	tx, err := db.Begin(ctx)
 	if err != nil {
@@ -59,12 +70,26 @@ func RecalculateMDR(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID,
 	if err != nil {
 		return RecalcResult{}, fmt.Errorf("settlement: RecalculateMDR: load merchant: %w", err)
 	}
+	schedules, err := LoadFeeSchedules(ctx, tx, merchantID)
+	if err != nil {
+		return RecalcResult{}, fmt.Errorf("settlement: RecalculateMDR: load fee schedules: %w", err)
+	}
+	var platformProcessedFils int64
+	if err := tx.QueryRow(ctx, `SELECT total_processed_fils FROM platform_stats WHERE id = 1`).Scan(&platformProcessedFils); err != nil {
+		return RecalcResult{}, fmt.Errorf("settlement: RecalculateMDR: read platform volume: %w", err)
+	}
+	rates := feeRates{
+		schedules:    schedules,
+		fallbackBps:  mdrBps,
+		tierBonusBps: VolumeTierMdrBonusBps(platformProcessedFils),
+		discountBps:  discountBps,
+	}
 
 	rows, err := tx.Query(ctx, `
 		SELECT id, batch_date, status, gross_fils, fee_fils, net_payout_fils
 		  FROM settlement_batches
 		 WHERE merchant_id = $1 AND batch_date >= $2 AND batch_date < $3
-		   AND status <> 'open'
+		   AND status = 'closed'
 		 ORDER BY batch_date
 		 FOR UPDATE
 	`, merchantID, from, to)
@@ -92,7 +117,7 @@ func RecalculateMDR(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID,
 
 	var adjusted []BatchAdjustment
 	for _, b := range batches {
-		newFee, err := recomputeBatchFee(ctx, tx, b.id, mdrBps, discountBps)
+		newFee, err := recomputeBatchFee(ctx, tx, b.id, rates)
 		if err != nil {
 			return RecalcResult{}, err
 		}
@@ -101,7 +126,8 @@ func RecalculateMDR(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID,
 			continue
 		}
 		newNetPayout := b.grossFils - newFee
-		// am: posts against the OLD batch id so it never lands in a new payout?? fixed in FP-244 i think
+		// The batch is still 'closed' (unpaid), so correcting its own
+		// figures is correct: the payout that follows pays the corrected net.
 		if err := postMdrAdjustment(ctx, tx, merchantID, b.id, diff); err != nil {
 			return RecalcResult{}, err
 		}
@@ -132,14 +158,32 @@ func RecalculateMDR(ctx context.Context, db *pgxpool.Pool, merchantID uuid.UUID,
 	return RecalcResult{BatchesConsidered: len(batches), Adjusted: adjusted}, nil
 }
 
-// recomputeBatchFee sums ComputeSettlementFee over every transaction_events
-// row carrying this batch's id — the same per-event-then-sum discipline
-// CloseBatch step 8 uses, never ApplyRateFils applied once to a pre-summed
-// total, so this recomputation can never itself diverge from what a fresh
-// CloseBatch would have produced at today's rate.
-func recomputeBatchFee(ctx context.Context, tx pgx.Tx, batchID uuid.UUID, mdrBps, discountBps int64) (money.Fils, error) {
+// feeRates is everything needed to rate one capture event the way
+// CloseBatch does.
+type feeRates struct {
+	schedules    []FeeScheduleRow
+	fallbackBps  int64
+	tierBonusBps int64
+	discountBps  int64
+}
+
+func (r feeRates) feeFor(amount money.Fils, occurredAt time.Time) money.Fils {
+	bps := EffectiveMdrBpsAt(r.schedules, occurredAt, r.fallbackBps) - r.tierBonusBps
+	if bps < 0 {
+		bps = 0
+	}
+	return ComputeSettlementFee(amount, bps, r.discountBps)
+}
+
+// recomputeBatchFee sums the per-event fee over the batch's capture events —
+// the same per-event-then-sum discipline CloseBatch step 8 uses — then takes
+// off the fee reversals of the refunds netted into this batch (FP-300), as
+// CloseBatch does, so an unchanged rate reproduces the frozen fee exactly.
+func recomputeBatchFee(ctx context.Context, tx pgx.Tx, batchID uuid.UUID, rates feeRates) (money.Fils, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT amount_fils FROM transaction_events WHERE settlement_batch_id = $1 ORDER BY id
+		SELECT amount_fils, occurred_at FROM transaction_events
+		 WHERE settlement_batch_id = $1 AND event_type IN ('captured', 'partially_captured')
+		 ORDER BY id
 	`, batchID)
 	if err != nil {
 		return 0, fmt.Errorf("settlement: RecalculateMDR: select batch events for %s: %w", batchID, err)
@@ -149,17 +193,24 @@ func recomputeBatchFee(ctx context.Context, tx pgx.Tx, batchID uuid.UUID, mdrBps
 	var fee money.Fils
 	for rows.Next() {
 		var amountFils int64
-		if err := rows.Scan(&amountFils); err != nil {
+		var occurredAt time.Time
+		if err := rows.Scan(&amountFils, &occurredAt); err != nil {
 			return 0, fmt.Errorf("settlement: RecalculateMDR: scan batch event for %s: %w", batchID, err)
 		}
-		// FH: sums every event with this batch id -- incl. refund events once FP-212 lands? need an event_type filter?
-		// MK: refunds won't carry settlement_batch_id on transaction_events, they live in their own table. non-issue
-		fee += ComputeSettlementFee(money.Fils(amountFils), mdrBps, discountBps)
+		fee += rates.feeFor(money.Fils(amountFils), occurredAt)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("settlement: RecalculateMDR: iterate batch events for %s: %w", batchID, err)
 	}
-	return fee, nil
+	rows.Close()
+
+	var refundFeeReversed int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(SUM(fee_reversed_fils), 0) FROM refunds WHERE settlement_batch_id = $1
+	`, batchID).Scan(&refundFeeReversed); err != nil {
+		return 0, fmt.Errorf("settlement: RecalculateMDR: sum refund fee reversals for %s: %w", batchID, err)
+	}
+	return fee - money.Fils(refundFeeReversed), nil
 }
 
 // postMdrAdjustment posts the two-leg, entry_group_id-balanced pair for one

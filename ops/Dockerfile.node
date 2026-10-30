@@ -1,0 +1,26 @@
+# Image for the Node services (apps/api, apps/reporting) and the one-off
+# migrate/seed jobs. Built from the repo root: context `..` in compose.
+# Debian slim rather than alpine: sharp (KYC thumbnails) ships glibc builds.
+FROM node:20-bookworm-slim
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+# Workspace manifests first so `npm ci` is cached until dependencies change.
+COPY package.json package-lock.json tsconfig.base.json tsconfig.json ./
+COPY packages/money/package.json packages/money/
+COPY packages/events/package.json packages/events/
+COPY apps/api/package.json apps/api/
+COPY apps/reporting/package.json apps/reporting/
+COPY apps/web/package.json apps/web/
+COPY apps/admin/package.json apps/admin/
+# Dev dependencies included: the services run through tsx.
+RUN npm ci --include=dev --no-audit --no-fund
+
+COPY packages packages
+COPY apps/api apps/api
+COPY apps/reporting apps/reporting
+COPY db db
+COPY scripts scripts
+
+USER node

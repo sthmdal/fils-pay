@@ -8,9 +8,10 @@ const ACQUIRER_SIGNATURE_HEADER = "acquirer-callback-signature";
 
 /**
  * Body of a fraud_review.completed callback. `outcome` is validated against
- * the AcquirerCallbackInput union ("approved" | "rejected") before it is
- * applied; any other value is a 400.
+ * the AcquirerCallbackInput union ("cleared" | "confirmed_fraud") before it
+ * is applied; any other value is a 400.
  */
+const ALLOWED_OUTCOMES: ReadonlySet<string> = new Set(["cleared", "confirmed_fraud"]);
 interface AcquirerCallbackBody {
   callbackId?: string;
   type?: string;
@@ -52,6 +53,10 @@ export async function acquirerCallbackRoutes(app: FastifyInstance): Promise<void
         "invalid_request",
         "callbackId, type, transactionId, occurredAt, outcome, and note are required",
       );
+    }
+    // The doc promised this check; the code only cast the string.
+    if (!ALLOWED_OUTCOMES.has(body.outcome)) {
+      throw new BadRequestError("invalid_request", "outcome must be cleared or confirmed_fraud");
     }
 
     const verification = verifyAcquirerCallbackSignature(

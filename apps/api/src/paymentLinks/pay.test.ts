@@ -1,32 +1,18 @@
+/**
+ * expiryReferenceTime is gone (FP-187): payment-link expiry is judged by the
+ * server's clock only, inside the claim UPDATE (`expires_at > now()`). Taking
+ * the public, unauthenticated request body's `submittedAt` as the reference
+ * time let anyone pay an expired link by sending an old timestamp.
+ *
+ * The behaviour is covered against a real database in
+ * routes/paymentLinks.test.ts ("FP-187: an expired link cannot be paid by
+ * sending an old submittedAt"). This file only guards that the old helper is
+ * not reintroduced.
+ */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { expiryReferenceTime } from "./pay.js";
+import * as pay from "./pay.js";
 
-// Tolerance for comparing a freshly-minted Date against the test's own
-// `Date.now()` — generous enough not to flake on a loaded CI box.
-const TOLERANCE_MS = 5_000;
-
-test("expiryReferenceTime: no value -> the server's own clock", () => {
-  const before = Date.now();
-  const resolved = expiryReferenceTime();
-  assert.ok(Math.abs(resolved.getTime() - before) < TOLERANCE_MS);
-});
-
-test("expiryReferenceTime: empty string -> the server's own clock", () => {
-  const before = Date.now();
-  const resolved = expiryReferenceTime("");
-  assert.ok(Math.abs(resolved.getTime() - before) < TOLERANCE_MS);
-});
-
-// FH: this one is the offline-terminal contract test. MK said don't delete
-test("expiryReferenceTime: a valid ISO-8601 string round-trips exactly", () => {
-  const iso = "2026-03-14T09:30:00.000Z";
-  assert.equal(expiryReferenceTime(iso).toISOString(), iso);
-});
-
-test("expiryReferenceTime: an unparseable value -> the server's own clock", () => {
-  const before = Date.now();
-  const resolved = expiryReferenceTime("not-a-timestamp");
-  assert.ok(!Number.isNaN(resolved.getTime()));
-  assert.ok(Math.abs(resolved.getTime() - before) < TOLERANCE_MS);
+test("pay.ts no longer exports a client-clock expiry helper", () => {
+  assert.equal((pay as Record<string, unknown>).expiryReferenceTime, undefined);
 });

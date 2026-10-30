@@ -36,12 +36,18 @@ test("buildQuery keeps a cursor byte-exact", () => {
   assert.equal(buildQuery({ cursor }), `?cursor=${cursor}`);
 });
 
-// FH: covers negatives too
 test("bhd formats integer fils via @filspay/money, never float arithmetic", () => {
   assert.equal(bhd(0), "0.000 BHD");
   assert.equal(bhd(1), "0.001 BHD");
   assert.equal(bhd(1000), "1.000 BHD");
   assert.equal(bhd(1234567), "1234.567 BHD");
+});
+
+// The old "covers negatives too" note was wrong: there was no negative case,
+// and bhd threw on one — which is what a refund timeline event carries.
+test("bhd formats a negative amount (refund events) instead of throwing", () => {
+  assert.equal(bhd(-2500), "-2.500 BHD");
+  assert.equal(bhd(-1), "-0.001 BHD");
 });
 
 test("dash renders absent values as an em dash but keeps zero", () => {
@@ -51,8 +57,9 @@ test("dash renders absent values as an em dash but keeps zero", () => {
   assert.equal(dash(0), "0");
 });
 
-test("dayStartIso converts a date input to a UTC day boundary", () => {
-  assert.equal(dayStartIso("2026-09-12"), "2026-09-12T00:00:00.000Z");
+test("dayStartIso converts a date input to the Asia/Bahrain day boundary", () => {
+  // Bahrain midnight is 21:00Z the previous day — same day settlement uses.
+  assert.equal(dayStartIso("2026-09-12"), "2026-09-11T21:00:00.000Z");
   assert.equal(dayStartIso(""), undefined);
 });
 

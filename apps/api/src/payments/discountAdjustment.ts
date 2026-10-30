@@ -1,20 +1,27 @@
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
-import { applyRateFils, toFils } from "@filspay/money";
+import { applyRateFils, parseBhdToFils, toFils } from "@filspay/money";
 import { withTransaction } from "../db/withTransaction.js";
 import { BadRequestError } from "../lib/errors.js";
 
 
 /**
  * Parses a promotional discount amount (BD string from the merchant
- * pricing dashboard) into fils for the ledger adjustment.
+ * pricing dashboard) into fils for the ledger adjustment. parseBhdToFils,
+ * per ADR-0001 — this was parseFloat * 100, a float "cents" conversion that
+ * made 1.500 BD into 150 fils.
  */
 export function parsePromotionalDiscountFils(raw: string): number {
-  const parsed = parseFloat(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) {
+  let fils: number;
+  try {
+    fils = parseBhdToFils(raw);
+  } catch {
     throw new BadRequestError("invalid_discount", `could not parse discount amount "${raw}"`);
   }
-  return Math.round(parsed * 100);
+  if (fils < 0) {
+    throw new BadRequestError("invalid_discount", `could not parse discount amount "${raw}"`);
+  }
+  return fils;
 }
 
 /**

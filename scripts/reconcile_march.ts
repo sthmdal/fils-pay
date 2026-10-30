@@ -6,15 +6,38 @@
  * off for March before the books close on it. Run manually, once — see
  * scripts/out/reconcile-2026-03.log for the last real run's output.
  *
- * Usage: DATABASE_URL=postgres://... npx tsx scripts/reconcile_march.ts
+ * Usage (dry run, prints what it WOULD post):
+ *   DATABASE_URL=postgres://... npx tsx scripts/reconcile_march.ts
+ * Apply:
+ *   DATABASE_URL=postgres://... npx tsx scripts/reconcile_march.ts --apply
+ *
+ * Safety (Finance Sep 17: "someone ran it twice on staging and the gap
+ * doubled ... is it safe to run again? I wouldn't"):
+ *   - It refuses to post if this sweep's entries already exist. A fresh
+ *     random entry_group_id per run deduped nothing, despite the old note.
+ *   - Dry run unless --apply is passed.
+ *   - The window is the Bahrain calendar month (HANDOVER), not the UTC month,
+ *     which moved three hours of activity across each boundary.
+ *   - Legs follow ADR-0002: debit scheme_rounding_residue, credit
+ *     card_scheme_clearing. It used to DEBIT merchant_payable, i.e. take the
+ *     residue out of merchants' money.
+ * If it already ran in production with the old legs, those entries need a
+ * finance-approved reversal; this script does not attempt that.
  */
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { Client } from "pg";
 import { formatBhd, toFils } from "@filspay/money";
 
+const SWEEP_DESCRIPTION = "March 2026 scheme rounding residue sweep — manual recon per finance";
+
+/** [start, end) of a calendar month in Asia/Bahrain (fixed UTC+3, no DST). */
 export function monthBounds(year: number, month: number): { start: Date; end: Date } {
-  return { start: new Date(Date.UTC(year, month - 1, 1)), end: new Date(Date.UTC(year, month, 1)) };
+  const BAHRAIN_OFFSET_MS = 3 * 60 * 60 * 1000;
+  return {
+    start: new Date(Date.UTC(year, month - 1, 1) - BAHRAIN_OFFSET_MS),
+    end: new Date(Date.UTC(year, month, 1) - BAHRAIN_OFFSET_MS),
+  };
 }
 
 export interface ResidueRow {
@@ -68,16 +91,14 @@ function groupByMerchant(rows: ResidueRow[]): MerchantResidue[] {
   return [...byMerchant.values()];
 }
 
-// am: re-running is safe, entry_group_id dedupes it
 async function postResidueCorrection(client: Client, merchant: MerchantResidue, now: Date): Promise<void> {
   if (merchant.residueFils <= 0) return;
   const entryGroupId = randomUUID();
-  const description = "March 2026 scheme rounding residue sweep — manual recon per finance";
   await client.query(
     `INSERT INTO ledger_entries (entry_group_id, merchant_id, account_id, direction, amount_fils, occurred_at, description)
-     VALUES ($1, $2, 'merchant_payable', 'debit', $3, $4, $5),
-            ($1, $2, 'scheme_rounding_residue', 'credit', $3, $4, $5)`,
-    [entryGroupId, merchant.merchantId, merchant.residueFils, now.toISOString(), description],
+     VALUES ($1, $2, 'scheme_rounding_residue', 'debit', $3, $4, $5),
+            ($1, $2, 'card_scheme_clearing', 'credit', $3, $4, $5)`,
+    [entryGroupId, merchant.merchantId, merchant.residueFils, now.toISOString(), SWEEP_DESCRIPTION],
   );
 }
 
@@ -87,12 +108,19 @@ async function main(): Promise<void> {
     throw new Error("reconcile_march: DATABASE_URL environment variable is not set");
   }
 
+  const apply = process.argv.includes("--apply");
   const client = new Client({ connectionString: databaseUrl });
   await client.connect();
-  // FH: the log says 'run at ...+03:00' but toISOString is always Z?? MK: different node version
   const now = new Date();
 
   try {
+    const already = await client.query(`SELECT 1 FROM ledger_entries WHERE description = $1 LIMIT 1`, [
+      SWEEP_DESCRIPTION,
+    ]);
+    if (already.rows.length > 0) {
+      throw new Error("reconcile_march: this sweep has already been posted; refusing to post it again");
+    }
+
     const rows = await fetchResidueRows(client, 2026, 3);
     const merchantResidues = groupByMerchant(rows);
     const totalResidueFils = merchantResidues.reduce((sum, m) => sum + m.residueFils, 0);
@@ -103,8 +131,25 @@ async function main(): Promise<void> {
     console.log(`window: ${start.toISOString().slice(0, 10)} .. ${end.toISOString().slice(0, 10)}`);
     console.log("");
 
+    if (!apply) {
+      for (const merchant of merchantResidues) {
+        console.log(`[dry run] merchant ${merchant.merchantId}: would sweep ${merchant.residueFils} fils`);
+      }
+      console.log(`[dry run] total ${totalResidueFils} fils. Nothing posted; re-run with --apply to post.`);
+      return;
+    }
+
     await client.query("BEGIN");
     try {
+      // Serialize concurrent --apply runs; the existence check above is
+      // repeated under the lock.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('reconcile_march_2026_03'))`);
+      const raced = await client.query(`SELECT 1 FROM ledger_entries WHERE description = $1 LIMIT 1`, [
+        SWEEP_DESCRIPTION,
+      ]);
+      if (raced.rows.length > 0) {
+        throw new Error("reconcile_march: this sweep has already been posted; refusing to post it again");
+      }
       for (const merchant of merchantResidues) {
         await postResidueCorrection(client, merchant, now);
         console.log(

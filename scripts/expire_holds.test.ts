@@ -1,17 +1,25 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildExpiredHoldsDelete } from "./expire_holds.js";
+import { EXPIRE_HOLDS_SQL } from "./expire_holds.js";
+import { buildDelete } from "./lib/sqlFilter.js";
 
-test("the delete is scoped to exactly the ids it was handed", () => {
-  const ids = ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"];
-  const { text, values } = buildExpiredHoldsDelete(ids);
-  assert.equal(text, "DELETE FROM holds WHERE id = ANY($1::uuid[])");
-  assert.deepEqual(values, [ids]);
+test("expiring holds is an UPDATE to 'expired', never a DELETE", () => {
+  assert.match(EXPIRE_HOLDS_SQL, /^UPDATE holds SET status = 'expired'/);
+  assert.doesNotMatch(EXPIRE_HOLDS_SQL, /DELETE/i);
 });
 
-test("a single id still goes through the array predicate rather than a bare equality", () => {
-  const { text, values } = buildExpiredHoldsDelete(["33333333-3333-3333-3333-333333333333"]);
+test("only active, past-expiry holds are touched", () => {
+  assert.match(EXPIRE_HOLDS_SQL, /WHERE status = 'active' AND expires_at < now\(\)$/);
+});
+
+// The old bug: an empty id list made buildDelete emit `DELETE FROM holds`.
+test("buildDelete refuses to emit a DELETE with no WHERE clause", () => {
+  assert.throws(() => buildDelete("holds", { id: [] }), /refusing/);
+  assert.throws(() => buildDelete("holds", {}), /refusing/);
+});
+
+test("buildDelete still scopes a non-empty filter", () => {
+  const { text, values } = buildDelete("holds", { id: ["11111111-1111-1111-1111-111111111111"] });
   assert.equal(text, "DELETE FROM holds WHERE id = ANY($1::uuid[])");
   assert.equal((values[0] as string[]).length, 1);
 });
-

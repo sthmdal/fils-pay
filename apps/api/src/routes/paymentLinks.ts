@@ -32,9 +32,9 @@ interface CreatePaymentLinkBody {
 }
 
 /**
- * card: simulated card input. submittedAt: optional ISO-8601 instant from an
- * offline terminal; ignored unless the request is authenticated with an API
- * key.
+ * card: simulated card input. submittedAt: accepted for compatibility and
+ * ignored — this route is public, so expiry is always the server's clock
+ * (FP-187).
  */
 interface PayPaymentLinkBody {
   card?: SimulatedCardInput;
@@ -104,6 +104,7 @@ export async function paymentLinkMerchantRoutes(app: FastifyInstance): Promise<v
       assertOwnMerchant(request);
       const result = await cancelPaymentLink(app.db, {
         id: request.params.id,
+        merchantId: request.params.merchantId,
       });
       if (result.outcome === "canceled") {
         reply.code(204).send();

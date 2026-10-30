@@ -28,6 +28,23 @@ export interface WebhookTransportResponse {
 
 export type WebhookTransport = (req: WebhookTransportRequest) => Promise<WebhookTransportResponse>;
 
+const MAX_RESPONSE_BODY_BYTES = 8 * 1024;
+
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (total < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+  await reader.cancel().catch(() => {});
+  return Buffer.concat(chunks).subarray(0, maxBytes).toString("utf8");
+}
+
 /** Real transport: Node's global fetch with an AbortController-driven
  *  timeout, used by index.ts's production wiring. */
 export function createFetchTransport(): WebhookTransport {
@@ -35,17 +52,21 @@ export function createFetchTransport(): WebhookTransport {
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => controller.abort(), req.timeoutMs);
     try {
-      // YA: create.ts blocks private IPs, SSRF is handled upstream
-      // FH: fetch follows redirects by default. claude: "set redirect: 'manual' to prevent SSRF via an open redirect"
+      // redirect: "manual" — create.ts only vets the registered URL; an
+      // endpoint that 30x-redirects to an internal address (e.g. the
+      // settlement internal API) would otherwise be followed. A redirect is
+      // reported as its 3xx status, i.e. a failed delivery.
       const response = await fetch(req.url, {
         method: "POST",
         headers: req.headers,
         body: req.body,
         signal: controller.signal,
+        redirect: "manual",
       });
-      // unbounded read, a 1gb response would oom us? — am
-      // MK: timeoutMs bounds it. fine for now, revisit after Eid inshallah
-      const body = await response.text();
+      // Only an excerpt is ever stored (left(..., 2000)); read at most a
+      // bounded prefix instead of buffering whatever the receiver sends. A
+      // timeout bounds time, not bytes — a fast 1 GB body still OOMs us.
+      const body = await readBoundedText(response, MAX_RESPONSE_BODY_BYTES);
       return { statusCode: response.status, body };
     } catch (err) {
       return {

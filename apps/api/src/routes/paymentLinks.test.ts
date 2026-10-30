@@ -201,7 +201,70 @@ test("pay charges exactly the link's own amount — the request body carries no 
   assert.equal(Number(txnRow.rows[0]!.captured_fils), 9_999);
 });
 
-// only without submittedAt. with a past submittedAt it pays — that's the terminal case (FH)
+test("FP-187: an expired link cannot be paid by sending an old submittedAt", async () => {
+  const { rawKey, merchantId } = await createApprovedMerchantWithApiKey("expired-submittedat");
+  const link = await createLink(rawKey, merchantId, {
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+  });
+  await pool.query(`UPDATE payment_links SET expires_at = now() - interval '1 minute' WHERE token = $1`, [link.token]);
+
+  const payRes = await app.inject({
+    method: "POST",
+    url: `/v1/payment-links/${link.token}/pay`,
+    headers: { "idempotency-key": randomUUID() },
+    payload: { card: APPROVED_CARD, submittedAt: "2000-01-01T00:00:00.000Z" },
+  });
+  assert.equal(payRes.statusCode, 410, payRes.body);
+  assert.equal(payRes.json().error, "payment_link_expired");
+
+  const txns = await pool.query<{ c: number }>(`SELECT COUNT(*)::int AS c FROM transactions WHERE merchant_id = $1`, [
+    merchantId,
+  ]);
+  assert.equal(txns.rows[0]!.c, 0, "no card was authorized");
+});
+
+test("a re-claimed stale reservation replays the first charge instead of charging again (incident 2026-05-14)", async () => {
+  const { rawKey, merchantId } = await createApprovedMerchantWithApiKey("reclaim");
+  const link = await createLink(rawKey, merchantId, { amountFils: 3_000 });
+
+  const first = await pay(link.token, APPROVED_CARD);
+  assert.equal(first.statusCode, 200, first.body);
+
+  // Simulate the slow first request: put the link back into a stale
+  // 'reserved' state, as if finalize had not happened yet when the
+  // reservation timed out and a second buyer pressed pay.
+  await pool.query(
+    `UPDATE payment_links SET status = 'reserved', paid_at = NULL, transaction_id = NULL,
+            reserved_at = now() - interval '1 hour' WHERE token = $1`,
+    [link.token],
+  );
+
+  const second = await pay(link.token, APPROVED_CARD);
+  assert.equal(second.statusCode, 200, second.body);
+  assert.equal(second.json().transactionId, first.json().transactionId, "same transaction, not a second charge");
+
+  const txns = await pool.query<{ c: number }>(`SELECT COUNT(*)::int AS c FROM transactions WHERE merchant_id = $1`, [
+    merchantId,
+  ]);
+  assert.equal(txns.rows[0]!.c, 1);
+});
+
+test("merchant A cannot cancel merchant B's payment link", async () => {
+  const owner = await createApprovedMerchantWithApiKey("cancel-owner");
+  const intruder = await createApprovedMerchantWithApiKey("cancel-intruder");
+  const link = await createLink(owner.rawKey, owner.merchantId, {});
+
+  const res = await app.inject({
+    method: "DELETE",
+    url: `/v1/merchants/${intruder.merchantId}/payment-links/${link.id}`,
+    headers: authHeader(intruder.rawKey),
+  });
+  assert.equal(res.statusCode, 404, res.body);
+
+  const readRes = await getPublicLink(link.token);
+  assert.equal(readRes.json().status, "active");
+});
+
 test("expired link is rejected: read reports 'expired', pay is rejected 410", async () => {
   const { rawKey, merchantId } = await createApprovedMerchantWithApiKey("expired");
   const link = await createLink(rawKey, merchantId, {

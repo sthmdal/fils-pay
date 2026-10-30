@@ -20,12 +20,13 @@ import (
 // individually, is the one place this logic needs to exist regardless of
 // which of the two paid the batch.
 //
-// Idempotent by construction: the NOT EXISTS guard means re-running this
-// scan — on every daemon tick, or a second time after a crash before this
-// function's own commit landed — never enqueues a second outbox event for
-// the same batch.
-// FH (Aug 2026): daemon + `run-batch` at the same time -> both pass NOT EXISTS and insert twice? claude: "No, outbox_events has a unique index on (event_type, aggregate_id)."
-// MK: fine for now. daemon and CLI never overlap.
+// Idempotent, including under concurrency (incident 2026-08-21). The scan's
+// NOT EXISTS is only a filter: two processes (the daemon and a `run-batch`,
+// or the admin run-batch button) both passed it and both inserted, and there
+// is NO unique index on outbox_events to stop them. Each insert therefore
+// re-checks inside its own transaction while holding an advisory lock on the
+// batch id, so concurrent runs serialize per batch and the second one sees
+// the first one's row.
 func EnqueuePayoutNotifications(ctx context.Context, db *pgxpool.Pool) (int, error) {
 	// Ordered by paid_at so notifications go out in payout order. LIMIT 500
 	// bounds one scan; the next tick picks up whatever is left.
@@ -83,14 +84,41 @@ func EnqueuePayoutNotifications(ctx context.Context, db *pgxpool.Pool) (int, err
 		if err != nil {
 			return count, fmt.Errorf("settlement: EnqueuePayoutNotifications: marshal payload: %w", err)
 		}
-		_, err = db.Exec(ctx, `
-			INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, payload)
-			VALUES ('settlement.paid', 'settlement_batch', $1, $2)
-		`, b.id, payload)
+		inserted, err := enqueuePaidEventOnce(ctx, db, b.id, payload)
 		if err != nil {
 			return count, fmt.Errorf("settlement: EnqueuePayoutNotifications: insert batch %s: %w", b.id, err)
 		}
-		count++
+		if inserted {
+			count++
+		}
 	}
 	return count, nil
+}
+
+// enqueuePaidEventOnce inserts the batch's settlement.paid event unless one
+// already exists, serialized per batch by a transaction-scoped advisory lock.
+func enqueuePaidEventOnce(ctx context.Context, db *pgxpool.Pool, batchID uuid.UUID, payload []byte) (bool, error) {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('settlement.paid:' || $1::text))`, batchID); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO outbox_events (event_type, aggregate_type, aggregate_id, payload)
+		SELECT 'settlement.paid', 'settlement_batch', $1, $2
+		 WHERE NOT EXISTS (
+		   SELECT 1 FROM outbox_events WHERE event_type = 'settlement.paid' AND aggregate_id = $1
+		 )
+	`, batchID, payload)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }

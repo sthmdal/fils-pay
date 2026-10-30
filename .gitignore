@@ -2,7 +2,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 .env
-.env.local
+.env.*
+!.env.example
+ops/.env
 npm-debug.log*
 .DS_Store
 .claude/

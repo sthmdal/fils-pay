@@ -5,12 +5,21 @@ import type { ReportingConfig } from "../config.js";
 import { readCursor, advanceCursor } from "./cursor.js";
 import { applyEvent, type OutboxEventRow } from "./applyEvent.js";
 
-// am: refund.succeeded not here yet. when refunds ship just add it to the list
 export const REPORTING_EVENT_TYPES: readonly EventType[] = [
   "transaction.captured",
   "transaction.voided",
+  "refund.succeeded",
   "settlement.batch_closed",
 ];
+
+/**
+ * Outbox ids are taken when a row is inserted, not when its transaction
+ * commits, so a slow writer (CloseBatch) can commit id 100 after id 101 is
+ * already visible. Consuming by `id > cursor` would then skip 100 forever.
+ * Only rows older than this lag are consumed, which gives in-flight writers
+ * time to commit before the cursor passes them.
+ */
+const COMMIT_ORDER_SAFETY_LAG = "10 seconds";
 
 /**
  * Keys this worker's row in reporting_outbox_cursor. Two processes using the
@@ -42,15 +51,15 @@ export async function runConsumerPass(
   return withTransaction(pool, async (client) => {
     const cursor = await readCursor(client, CONSUMER_NAME);
 
-    // MK 2026-06: ids come from a sequence, they're monotonic. fine for now.
     const eventsResult = await client.query<OutboxEventRow>(
       `SELECT id, event_type, aggregate_id, payload, created_at
          FROM outbox_events
         WHERE id > $1
           AND event_type = ANY($2::text[])
+          AND created_at < now() - $4::interval
         ORDER BY id ASC
         LIMIT $3`,
-      [cursor.lastProcessedId.toString(), REPORTING_EVENT_TYPES, config.consumerBatchLimit],
+      [cursor.lastProcessedId.toString(), REPORTING_EVENT_TYPES, config.consumerBatchLimit, COMMIT_ORDER_SAFETY_LAG],
     );
 
     // FH: redundant with ORDER BY id ASC (last row is max). harmless
