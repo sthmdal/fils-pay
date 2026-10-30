@@ -868,6 +868,21 @@ test("API key rotation issues a new key atomically and audits it; the previous k
   assert.equal(audit.length, 1);
   assert.equal(audit[0]!.target_id, original.id);
   assert.equal((audit[0]!.metadata as { newKeyId?: string }).newKeyId, rotated.id);
+
+  // ...but the overlap window ENDS. Before, revoke_after was never set or
+  // enforced, so a rotated (possibly leaked) key worked forever.
+  const scheduled = await pool.query<{ revoke_after: Date | null }>(
+    `SELECT revoke_after FROM api_keys WHERE id = $1`,
+    [original.id],
+  );
+  assert.ok(scheduled.rows[0]!.revoke_after, "rotation schedules the previous key's revocation");
+  await pool.query(`UPDATE api_keys SET revoke_after = now() - interval '1 second' WHERE id = $1`, [original.id]);
+  const expired = await app.inject({
+    method: "GET",
+    url: "/v1/transactions",
+    headers: { authorization: `Bearer ${original.rawKey}` },
+  });
+  assert.equal(expired.statusCode, 401, "the previous key stops working once the overlap window passes");
 });
 
 test("rotating an already-revoked key is a 409; rotating another merchant's key is a 404", async () => {

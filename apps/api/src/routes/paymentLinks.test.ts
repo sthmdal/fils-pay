@@ -379,7 +379,9 @@ test(
     );
     const row = claimed.rows[0]!;
 
-    const authorizeKey = `paylink:${row.id}:${idempotencyKey}:authorize`;
+    // Keys are scoped to the link's pay attempt (0 for a first attempt), not
+    // the client's Idempotency-Key (incident 2026-05-14).
+    const authorizeKey = `paylink:${row.id}:0:authorize`;
     const authRes = await authorizeTransaction(pool, app.acquirer, {
       merchantId: row.merchant_id,
       amountFils: toFils(Number(row.amount_fils)),
@@ -391,7 +393,7 @@ test(
     assert.equal(authRes.statusCode, 201, JSON.stringify(authRes.body));
     const txnId = (authRes.body as { id: string }).id;
 
-    const captureKey = `paylink:${row.id}:${idempotencyKey}:capture`;
+    const captureKey = `paylink:${row.id}:0:capture`;
     const capRes = await captureTransaction(pool, app.acquirer, {
       transactionId: txnId,
       merchantId: row.merchant_id,

@@ -5,6 +5,9 @@ import { issueApiKeyInTx, type IssuedApiKey } from "../apiKeys/issue.js";
 import { withTransaction } from "../db/withTransaction.js";
 import { ConflictError, NotFoundError } from "../lib/errors.js";
 
+/** How long a rotated-out key keeps working. */
+export const ROTATION_OVERLAP = "1 hour";
+
 export interface RotatedApiKey extends IssuedApiKey {
   previousKeyId: string;
 }
@@ -35,12 +38,15 @@ export async function rotateApiKeyAsAdmin(
       rotatedFromKeyId: input.apiKeyId,
     });
 
-    // The point of a rotation: the old (possibly leaked) key stops working,
-    // in the same transaction that issues its replacement. Nothing did this
-    // before, so a "rotated" key kept authenticating indefinitely.
+    // Staged revocation (0056): the old key keeps working for a short overlap
+    // window so the merchant can deploy the replacement, then stops. Nothing
+    // ever set revoke_after and no sweep job existed, so a "rotated" (possibly
+    // leaked) key kept authenticating forever. verifyApiKey enforces it at
+    // request time, so no sweep is needed.
     await client.query(
-      `UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND merchant_id = $2 AND revoked_at IS NULL`,
-      [input.apiKeyId, input.merchantId],
+      `UPDATE api_keys SET revoke_after = now() + $3::interval
+        WHERE id = $1 AND merchant_id = $2 AND revoked_at IS NULL`,
+      [input.apiKeyId, input.merchantId, ROTATION_OVERLAP],
     );
 
     await insertAdminAuditLog(client, {

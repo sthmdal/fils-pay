@@ -187,6 +187,13 @@ async function applyRefundSucceeded(client: PoolClient, row: OutboxEventRow): Pr
  * actually run against real data.
  */
 export async function applyEvent(client: PoolClient, row: OutboxEventRow): Promise<void> {
+  // Every rollup is keyed by merchant. An event without a merchantId can
+  // never be applied; throwing would roll back the pass and re-select the
+  // same event forever, halting ALL reporting. Skip it loudly instead.
+  if (typeof row.payload?.merchantId !== "string" || row.payload.merchantId === "") {
+    console.warn(`applyEvent: skipping outbox event ${String(row.id)} (${row.event_type}) with no merchantId`);
+    return;
+  }
   switch (row.event_type) {
     case "transaction.captured":
       return applyTransactionCaptured(client, row);
