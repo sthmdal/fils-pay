@@ -192,7 +192,9 @@ test("failing endpoint: backoff/exhaustion sequence across repeated runDispatchP
   assert.equal(delivery.status, "pending");
   assert.equal(delivery.attempt_count, 1);
   assert.equal(delivery.response_status_code, 500);
-  const expectedDelay1 = backoffDelayMs(1, config);
+  // Neutral jitter (0.5 -> factor 1.0) for the exact base value; the real
+  // call applies +/-10% random jitter, which the tolerance below allows for.
+  const expectedDelay1 = backoffDelayMs(1, config, () => 0.5);
   assert.equal(expectedDelay1, 1000);
   const actualDelay1 = delivery.next_attempt_at.getTime() - Date.now();
   assert.ok(Math.abs(actualDelay1 - expectedDelay1) < 3000, `expected ~${expectedDelay1}ms, got ${actualDelay1}ms`);

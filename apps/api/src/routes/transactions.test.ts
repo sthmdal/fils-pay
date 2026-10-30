@@ -406,8 +406,12 @@ test("two concurrent refunds with different keys cannot both take the full amoun
     refund(rawKey, merchantId, { transactionId: txn.id, amountFils: 8_000 }),
     refund(rawKey, merchantId, { transactionId: txn.id, amountFils: 8_000 }),
   ]);
+  // Exactly one succeeds. The loser waited on the row lock, then saw the
+  // transaction already fully refunded: 409 transaction_not_refundable (or
+  // 422 refund_exceeds_refundable if it was only partially refunded).
   const codes = [a.statusCode, b.statusCode].sort();
-  assert.deepEqual(codes, [200, 422], `${a.body} / ${b.body}`);
+  assert.equal(codes[0], 200, `${a.body} / ${b.body}`);
+  assert.ok(codes[1] === 409 || codes[1] === 422, `${a.body} / ${b.body}`);
 
   const total = await pool.query<{ refunded: string }>(
     `SELECT COALESCE(SUM(amount_fils), 0)::text AS refunded FROM refunds WHERE transaction_id = $1`,
