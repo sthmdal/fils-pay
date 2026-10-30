@@ -214,7 +214,7 @@ test("failing endpoint: backoff/exhaustion sequence across repeated runDispatchP
   delivery = await getDelivery(String(outboxEvent.id), endpoint.id);
   assert.equal(delivery.status, "pending");
   assert.equal(delivery.attempt_count, 2);
-  const expectedDelay2 = backoffDelayMs(2, config);
+  const expectedDelay2 = backoffDelayMs(2, config, () => 0.5);
   assert.equal(expectedDelay2, 2000);
   const actualDelay2 = delivery.next_attempt_at.getTime() - Date.now();
   assert.ok(Math.abs(actualDelay2 - expectedDelay2) < 3000, `expected ~${expectedDelay2}ms, got ${actualDelay2}ms`);
