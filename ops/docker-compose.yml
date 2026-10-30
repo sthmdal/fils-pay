@@ -62,6 +62,8 @@ services:
       context: ..
       dockerfile: ops/Dockerfile.node
     command: ["npm", "run", "seed"]
+    # The seed loads apps/api's config, which requires the production secrets.
+    env_file: .env
     environment: *app-env
     depends_on:
       migrate:
