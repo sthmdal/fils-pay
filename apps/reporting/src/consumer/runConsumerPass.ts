@@ -16,10 +16,10 @@ export const REPORTING_EVENT_TYPES: readonly EventType[] = [
  * Outbox ids are taken when a row is inserted, not when its transaction
  * commits, so a slow writer (CloseBatch) can commit id 100 after id 101 is
  * already visible. Consuming by `id > cursor` would then skip 100 forever.
- * Only rows older than this lag are consumed, which gives in-flight writers
- * time to commit before the cursor passes them.
+ * Only rows older than config.commitOrderSafetyLagMs are consumed, which
+ * gives in-flight writers time to commit before the cursor passes them
+ * (10s in production, 0 by default — see config.ts).
  */
-const COMMIT_ORDER_SAFETY_LAG = "10 seconds";
 
 /**
  * Keys this worker's row in reporting_outbox_cursor. Two processes using the
@@ -46,8 +46,9 @@ export const CONSUMER_NAME = "reporting";
  */
 export async function runConsumerPass(
   pool: Pool,
-  config: Pick<ReportingConfig, "consumerBatchLimit">,
+  config: Pick<ReportingConfig, "consumerBatchLimit" | "commitOrderSafetyLagMs">,
 ): Promise<{ processedCount: number }> {
+  const lagMs = config.commitOrderSafetyLagMs ?? 0;
   return withTransaction(pool, async (client) => {
     const cursor = await readCursor(client, CONSUMER_NAME);
 
@@ -56,10 +57,10 @@ export async function runConsumerPass(
          FROM outbox_events
         WHERE id > $1
           AND event_type = ANY($2::text[])
-          AND created_at < now() - $4::interval
+          AND created_at <= now() - ($4::int * interval '1 millisecond')
         ORDER BY id ASC
         LIMIT $3`,
-      [cursor.lastProcessedId.toString(), REPORTING_EVENT_TYPES, config.consumerBatchLimit, COMMIT_ORDER_SAFETY_LAG],
+      [cursor.lastProcessedId.toString(), REPORTING_EVENT_TYPES, config.consumerBatchLimit, lagMs],
     );
 
     // FH: redundant with ORDER BY id ASC (last row is max). harmless

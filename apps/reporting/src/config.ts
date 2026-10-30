@@ -16,6 +16,11 @@ export interface ReportingConfig {
   /** Max outbox rows read per runConsumerPass call — matches webhooks'
    *  Step A cap. */
   consumerBatchLimit: number;
+  /** Only outbox rows older than this are consumed, so a slow writer that
+   *  took a lower id but committed later is not skipped (ids are assigned at
+   *  insert, not commit). 10s in production; 0 elsewhere so tests and local
+   *  runs see their own events immediately. REPORTING_COMMIT_LAG_MS overrides. */
+  commitOrderSafetyLagMs?: number;
 }
 
 /**
@@ -44,5 +49,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ReportingConfi
     // MK: 15s fine. dashboards aren't realtime.
     reportingPollIntervalMs: parseIntEnv(env.REPORTING_POLL_INTERVAL_MS, 15_000),
     consumerBatchLimit: parseIntEnv(env.REPORTING_CONSUMER_BATCH_LIMIT, 500),
+    commitOrderSafetyLagMs: parseIntEnv(env.REPORTING_COMMIT_LAG_MS, env.NODE_ENV === "production" ? 10_000 : 0),
   };
 }
