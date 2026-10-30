@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 # Builds and tests the whole monorepo on every push / PR against a throwaway
 # Postgres. Steps after `migrate` run even if an earlier one failed, so a
@@ -41,7 +41,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - uses: actions/setup-go@v5
