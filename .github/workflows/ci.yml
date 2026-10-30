@@ -1,0 +1,105 @@
+name: CI
+
+# Builds and tests the whole monorepo on every push / PR against a throwaway
+# Postgres. Steps after `migrate` run even if an earlier one failed, so a
+# single run reports every failure at once.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: filspay
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: filspay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U filspay -d filspay"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      DATABASE_URL: postgres://filspay:ci@localhost:5432/filspay
+      TZ: UTC
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/settlement/go.mod
+          cache-dependency-path: apps/settlement/go.sum
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Migrate (fresh database)
+        run: npm run migrate
+
+      - name: Typecheck
+        if: ${{ !cancelled() }}
+        run: npm run typecheck
+
+      - name: Test packages/money
+        if: ${{ !cancelled() }}
+        run: npm test -w packages/money
+
+      - name: Test packages/events
+        if: ${{ !cancelled() }}
+        run: npm test -w packages/events
+
+      - name: Test apps/api
+        if: ${{ !cancelled() }}
+        run: npm test -w apps/api
+
+      - name: Test apps/reporting
+        if: ${{ !cancelled() }}
+        run: npm test -w apps/reporting
+
+      - name: Test apps/web
+        if: ${{ !cancelled() }}
+        run: npm test -w apps/web
+
+      - name: Test scripts
+        if: ${{ !cancelled() }}
+        run: npx tsx --test scripts/*.test.ts
+
+      - name: Go vet
+        if: ${{ !cancelled() }}
+        working-directory: apps/settlement
+        run: go vet ./...
+
+      - name: Go test
+        if: ${{ !cancelled() }}
+        working-directory: apps/settlement
+        run: go test -count=1 -p 1 ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build node image
+        run: docker build -f ops/Dockerfile.node -t filspay-node .
+      - name: Build settlement image
+        if: ${{ !cancelled() }}
+        run: docker build -f ops/Dockerfile.go -t filspay-settlement .
