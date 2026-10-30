@@ -1,4 +1,4 @@
-name: CI
+﻿name: CI
 
 # Builds and tests the whole monorepo on every push / PR against a throwaway
 # Postgres. Steps after `migrate` run even if an earlier one failed, so a
@@ -50,48 +50,48 @@ jobs:
           cache-dependency-path: apps/settlement/go.sum
 
       - name: Install
-        run: npm ci --no-audit --no-fund
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npm ci --no-audit --no-fund
 
       - name: Migrate (fresh database)
-        run: npm run migrate
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npm run migrate
 
       - name: Typecheck
         if: ${{ !cancelled() }}
-        run: npm run typecheck
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npm run typecheck
 
       - name: Test packages/money
         if: ${{ !cancelled() }}
-        run: npm test -w packages/money
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npm test -w packages/money
 
       - name: Test packages/events
         if: ${{ !cancelled() }}
-        run: npm test -w packages/events
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npm test -w packages/events
 
       - name: Test apps/api
         if: ${{ !cancelled() }}
-        run: npm test -w apps/api
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npm test -w apps/api
 
       - name: Test apps/reporting
         if: ${{ !cancelled() }}
-        run: npm test -w apps/reporting
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npm test -w apps/reporting
 
       - name: Test apps/web
         if: ${{ !cancelled() }}
-        run: npm test -w apps/web
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npm test -w apps/web
 
       - name: Test scripts
         if: ${{ !cancelled() }}
-        run: npx tsx --test scripts/*.test.ts
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" npx tsx --test scripts/*.test.ts
 
       - name: Go vet
         if: ${{ !cancelled() }}
         working-directory: apps/settlement
-        run: go vet ./...
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" go vet ./...
 
       - name: Go test
         if: ${{ !cancelled() }}
         working-directory: apps/settlement
-        run: go test -count=1 -p 1 ./...
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" go test -count=1 -p 1 ./...
 
   docker:
     runs-on: ubuntu-latest
@@ -99,7 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build node image
-        run: docker build -f ops/Dockerfile.node -t filspay-node .
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" docker build --progress=plain -f ops/Dockerfile.node -t filspay-node .
       - name: Build settlement image
         if: ${{ !cancelled() }}
-        run: docker build -f ops/Dockerfile.go -t filspay-settlement .
+        run: bash "$GITHUB_WORKSPACE/.github/ci-run.sh" docker build --progress=plain -f ops/Dockerfile.go -t filspay-settlement .
